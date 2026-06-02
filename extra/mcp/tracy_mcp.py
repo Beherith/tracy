@@ -26,6 +26,8 @@ import mcp.server.fastmcp as fastmcp
 logging.getLogger("uvicorn.error").setLevel(logging.CRITICAL)
 logging.getLogger("starlette").setLevel(logging.CRITICAL)
 
+logger = logging.getLogger("tracy_mcp")
+
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _PORT_FILE = os.path.join(_HERE, "tracy_mcp.port")
 _PID_FILE  = os.path.join(_HERE, "tracy_mcp.pid")
@@ -266,6 +268,7 @@ def _eval_guide_resource() -> str:
 @mcp_server.tool()
 async def list_captures() -> list[str]:
     """List .tracy capture files in the TRACY_CAPTURES_DIR directory (non-recursive)."""
+    logger.info("list_captures called")
     if not captures_dir:
         return []
     return sorted(glob.glob(os.path.join(captures_dir, "*.tracy")))
@@ -274,6 +277,7 @@ async def list_captures() -> list[str]:
 @mcp_server.tool()
 async def list_instances() -> list[dict]:
     """List all loaded Tracy instances and captures with metadata."""
+    logger.info("list_instances called")
     return [
         {
             "id": name,
@@ -292,6 +296,7 @@ async def discover_instances(port_range: str = "8086-8095") -> list[dict]:
 
     Returns a list of discovered ports that are listening.
     """
+    logger.info("discover_instances called with port_range=%s", port_range)
     start_port, end_port = map(int, port_range.split("-"))
     discovered = []
 
@@ -317,7 +322,9 @@ async def live_connect(address: str = "127.0.0.1", port: int = 8086, alias: str 
 
     Wraps Worker(addr, port, memoryLimit=-1). Returns the instance_id.
     """
+    logger.info("live_connect called with address=%s, port=%s, alias=%s", address, port, alias)
     if not tracy_server:
+        logger.error("Tracy Server bindings not found; cannot connect to live instance.")
         return "Error: Tracy Server bindings not found."
 
     # Pre-flight: read Tracy's UDP broadcast on port 8086 and compare protocol
@@ -329,6 +336,8 @@ async def live_connect(address: str = "127.0.0.1", port: int = 8086, alias: str 
     match = next((b for b in broadcasts if b.get("listen_port") == port), None)
     if match and _OUR_PROTOCOL_VERSION is not None:
         if match["protocol_version"] != _OUR_PROTOCOL_VERSION:
+            logger.error( "Protocol mismatch: target program '%s' announces Tracy protocol v%d on %s:%d, but bindings are built against v%d",
+                match["program"], match["protocol_version"], address, port, _OUR_PROTOCOL_VERSION)
             return (
                 f"Protocol mismatch: target program '{match['program']}' "
                 f"announces Tracy protocol v{match['protocol_version']} on "
@@ -340,6 +349,7 @@ async def live_connect(address: str = "127.0.0.1", port: int = 8086, alias: str 
     try:
         w = tracy_server.Worker(address, port)
     except Exception as e:
+        logger.error("Failed to connect to Tracy worker at %s:%s: %s", address, port, e)
         return f"Failed to connect: {str(e)}"
 
     # Worker construction returns immediately even on protocol failure (the
@@ -372,6 +382,8 @@ async def live_connect(address: str = "127.0.0.1", port: int = 8086, alias: str 
                 "the target may use TRACY_ON_DEMAND, a non-default broadcast "
                 "port, or isn't running."
             )
+        logger.error( "Handshake failed: reached %s:%s but worker did not connect within %.1fs. %s",
+            address, port, deadline_s, hint)
         return (
             f"Reached {address}:{port} but the Tracy handshake did not complete "
             f"within {deadline_s:.1f}s.{hint} Common causes: (1) the Tracy "
@@ -383,6 +395,7 @@ async def live_connect(address: str = "127.0.0.1", port: int = 8086, alias: str 
 
     name = alias or f"live_{address}_{port}"
     instances[name] = TracyInstance(name, w)
+    logger.info("Connected to live instance '%s' at %s:%s", name, address, port)
     return (
         f"Connected to live instance as '{name}'. "
         f"Before your first eval, read resources tracy://prompt "
@@ -405,6 +418,7 @@ async def load_capture(path: str, alias: str | None = None) -> str:
     If you don't already have a path, call `list_captures` first — it lists
     .tracy files in the TRACY_CAPTURES_DIR environment directory.
     """
+    logger.info("load_capture called with path=%s, alias=%s", path, alias)
     if not tracy_server:
         return "Error: Tracy Server bindings not found."
     try:
@@ -439,6 +453,7 @@ async def load_capture(path: str, alias: str | None = None) -> str:
 @mcp_server.tool()
 async def unload_capture(instance_id: str) -> str:
     """Unload a Tracy instance and release its memory."""
+    logger.info("unload_capture called with instance_id=%s", instance_id)
     if instance_id in instances:
         del instances[instance_id]
         return f"Instance '{instance_id}' unloaded."
@@ -456,6 +471,7 @@ async def tracy_eval(code: str, instance_id: str, async_mode: bool = False) -> o
 
     If async_mode=True, returns a task_id immediately; poll via the `task` tool.
     """
+    logger.info("tracy_eval called with instance_id=%s, async_mode=%s", instance_id, async_mode)
     if instance_id not in instances:
         return f"Error: Instance '{instance_id}' not found. Use list_instances to find valid IDs."
 
@@ -524,6 +540,7 @@ async def task(action: str, task_id: str | None = None) -> object:
 
     Actions: poll, cancel, list
     """
+    logger.info("task called with action=%s, task_id=%s", action, task_id)
     if action == "list":
         return [
             {"id": t.id, "status": t.status, "elapsed": time.time() - t.start_time}
@@ -562,6 +579,7 @@ async def shutdown_server() -> str:
     across all VS Code windows), this releases the TracyServerBindings.pyd lock
     for all clients at once. Restart tracy_mcp.py after rebuilding.
     """
+    logger.info("shutdown_server called")
     import threading
     def _exit() -> None:
         time.sleep(0.2)

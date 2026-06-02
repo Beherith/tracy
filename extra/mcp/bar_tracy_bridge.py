@@ -43,6 +43,8 @@ import threading
 import time
 from typing import Any, Dict, List, Optional
 
+_HERE = os.path.dirname(os.path.abspath(__file__))
+
 # ---------------------------------------------------------------------------
 # Logging
 # ---------------------------------------------------------------------------
@@ -50,11 +52,15 @@ _LOG_LEVEL = os.environ.get("BRIDGE_LOG_LEVEL", "INFO").upper()
 logger = logging.getLogger("bar_tracy_bridge")
 logger.setLevel(getattr(logging, _LOG_LEVEL, logging.INFO))
 
+formatter = logging.Formatter("[%(asctime)s] [BRIDGE] %(levelname)-5s %(message)s", datefmt="%H:%M:%S")
+
 _stderr_handler = logging.StreamHandler(sys.stderr)
-_stderr_handler.setFormatter(
-    logging.Formatter("[%(asctime)s] [BRIDGE] %(levelname)-5s %(message)s", datefmt="%H:%M:%S")
-)
+_stderr_handler.setFormatter(formatter)
 logger.addHandler(_stderr_handler)
+
+_file_handler = logging.FileHandler(os.path.join(_HERE, "bar_tracy_bridge.log"))
+_file_handler.setFormatter(formatter)
+logger.addHandler(_file_handler)
 
 # ---------------------------------------------------------------------------
 # Config
@@ -64,8 +70,6 @@ BAR_PORT = int(os.environ.get("BAR_MCP_PORT", "23452"))
 
 TRACY_HOST = os.environ.get("TRACY_MCP_HOST", "127.0.0.1")
 TRACY_PORT = int(os.environ.get("TRACY_MCP_PORT", "47380"))
-
-_HERE = os.path.dirname(os.path.abspath(__file__))
 _TRACY_MCP_SCRIPT = os.path.join(_HERE, "tracy_mcp.py")
 _TRACY_MCP_PID_FILE = os.path.join(_HERE, "tracy_mcp.pid")
 
@@ -732,17 +736,23 @@ class TracyHttpClient:
             event: <type>\n
             data: <json>\n
             \n
+
+        Multi-line data is supported per the SSE spec: consecutive ``data:``
+        lines are joined with newlines into a single payload.
         """
         event_type = "message"  # default event type
-        data = ""
+        data_lines: list[str] = []
 
         for line in text.split("\n"):
             if line.startswith("event: "):
                 event_type = line[7:].strip()
             elif line.startswith("data: "):
-                data = line[6:].strip()
+                data_lines.append(line[6:])
+            elif line.startswith("data"):
+                # edge case: ``data:value`` (no space after colon)
+                data_lines.append(line[4:])
 
-        return event_type, data
+        return event_type, "\n".join(data_lines)
 
     def disconnect(self) -> None:
         """Close the SSE session and stop the reader thread."""
@@ -813,8 +823,11 @@ class TracyHttpClient:
                             self._endpoint_event.set()
                         else:
                             logger.debug("Tracy SSE ► duplicate endpoint: %s", data)
-                    elif event_type == "result":
-                        # This is a JSON-RPC response
+                    elif event_type in ("message", "result"):
+                        # FastMCP (MCP Python SDK) sends JSON-RPC responses as
+                        # 'event: message'.  Handle both 'message' and 'result'
+                        # for forward compatibility.
+                        logger.debug("Tracy SSE ◄ %s event, data=%s", event_type, data[:200])
                         self._handle_sse_response(data)
                     elif event_type == "error":
                         logger.warning("Tracy SSE ► error event: %s", data[:200])
@@ -1161,17 +1174,72 @@ class TracyAutoStart:
                 timeout=15.0,
             )
 
-            if isinstance(result, str) and result.startswith("Error"):
-                logger.warning("Tracy live_connect failed: %s", result)
+            # call_tool returns the full MCP result dict:
+            #   {"content": [{"type": "text", "text": "..."}], "isError": false}
+            # Extract the plain text string from it.
+            if isinstance(result, dict):
+                content_list = result.get("content", [])
+                text_parts = [
+                    item.get("text", "")
+                    for item in content_list
+                    if isinstance(item, dict) and item.get("type") == "text"
+                ]
+                text_result = "\n".join(text_parts) if text_parts else str(result)
+            else:
+                text_result = str(result) if result is not None else ""
+
+            if text_result.startswith("Error"):
+                logger.warning("Tracy live_connect failed: %s", text_result)
                 return None
 
-            logger.info("Tracy MCP connected to engine: %s", result[:100])
-            return result
+            # The text contains: "Connected to live instance as 'live_engine'. ..."
+            # Extract the instance alias from the response.
+            match = re.search(r"as '([^']+)'", text_result)
+            instance_id = match.group(1) if match else "live_engine"
+            logger.info("Tracy MCP connected to engine: %s", text_result[:100])
+            return instance_id
 
         except TracyConnectionError as exc:
+            import traceback
             logger.warning(
-                "Tracy live_connect failed: %s — "
-                "is the engine built with TRACY_ENABLE?", exc
+                "Tracy live_connect failed — exception details:"
+            )
+            logger.warning(
+                "  Exception type    : %s",
+                type(exc).__name__,
+            )
+            logger.warning(
+                "  Exception message : %s",
+                str(exc),
+            )
+            logger.warning(
+                "  Exception args    : %s",
+                exc.args,
+            )
+            logger.warning(
+                "  Connection target : %s:%d",
+                address, port,
+            )
+            logger.warning(
+                "  Instance alias    : %s",
+                alias,
+            )
+            logger.warning(
+                "  Client connected  : %s",
+                client.connected if client else False,
+            )
+            if client and hasattr(client, "_message_url"):
+                logger.warning(
+                    "  SSE message URL   : %s",
+                    client._message_url,
+                )
+            logger.warning(
+                "  Traceback         :\n%s",
+                "".join(traceback.format_exception(type(exc), exc, exc.__traceback__)),
+            )
+            logger.warning(
+                "  Hint              : is the engine built with TRACY_ENABLE? "
+                "Is Tracy MCP running and healthy?"
             )
             return None
 
@@ -1919,19 +1987,15 @@ def main() -> None:
         try:
             tracy_client.connect()
             # Auto-connect to the engine's Tracy server
-            result = tracy_auto.auto_connect(
+            tracy_instance_id = tracy_auto.auto_connect(
                 tracy_client,
                 address="127.0.0.1",
                 port=8086,
                 alias="live_engine",
             )
-            # Extract instance ID from result message
-            if result:
-                # Result format: "Connected to live instance as 'live_engine'. ..."
-                match = re.search(r"as '([^']+)'", str(result))
-                if match:
-                    tracy_instance_id = match.group(1)
-                    logger.info("Tracy instance ID: %s", tracy_instance_id)
+            # auto_connect now returns the instance ID directly (e.g. "live_engine")
+            if tracy_instance_id:
+                logger.info("Tracy instance ID: %s", tracy_instance_id)
         except TracyConnectionError as exc:
             logger.warning("Tracy MCP connection failed (non-fatal): %s", exc)
             logger.warning("BAR tools will still work without Tracy")
