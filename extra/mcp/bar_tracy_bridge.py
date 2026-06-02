@@ -86,6 +86,7 @@ class BarTcpClient:
     - Newline-delimited JSON-RPC framing
     - Exponential backoff on reconnect
     - Thread-safe message sending
+    - Response demultiplexing by request ID (background reader thread)
     """
 
     def __init__(
@@ -104,6 +105,12 @@ class BarTcpClient:
         self._buffer = ""
         self._lock = threading.Lock()
         self._request_id = 0
+
+        # Response demultiplexing: request_id -> (Event, result_or_error)
+        self._pending: Dict[int, threading.Event] = {}
+        self._pending_results: Dict[int, Any] = {}
+        self._reader_running = False
+        self._reader_thread: Optional[threading.Thread] = None
 
     # ------------------------------------------------------------------
     # Connection lifecycle
@@ -125,7 +132,7 @@ class BarTcpClient:
             self._sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             self._sock.settimeout(5.0)
             self._sock.connect((self._host, self._port))
-            self._sock.settimeout(None)  # back to blocking for select()
+            self._sock.settimeout(1.0)  # non-blocking reads for reader loop
             self._buffer = ""
             logger.info("Connected to BAR MCP on %s", addr)
         except OSError as exc:
@@ -136,8 +143,12 @@ class BarTcpClient:
                 f"(Spring.Utilities.IsDevMode())  Detail: {exc}"
             ) from exc
 
+        # Start background reader thread
+        self._start_reader()
+
     def disconnect(self) -> None:
-        """Close the TCP connection."""
+        """Close the TCP connection and stop the reader thread."""
+        self._stop_reader()
         if self._sock:
             logger.info("Disconnecting from BAR MCP")
             self._cleanup_sock()
@@ -150,12 +161,178 @@ class BarTcpClient:
             pass
         self._sock = None
 
+    # ------------------------------------------------------------------
+    # Background reader thread
+    # ------------------------------------------------------------------
+
+    def _start_reader(self) -> None:
+        """Start the background reader thread if not already running."""
+        if self._reader_running and self._reader_thread and self._reader_thread.is_alive():
+            return
+        self._reader_running = True
+        self._reader_thread = threading.Thread(
+            target=self._reader_loop, daemon=True, name="bar-tcp-reader"
+        )
+        self._reader_thread.start()
+
+    def _stop_reader(self) -> None:
+        """Signal the reader thread to stop and wait for it."""
+        self._reader_running = False
+        if self._reader_thread and self._reader_thread.is_alive():
+            self._reader_thread.join(timeout=5.0)
+        self._reader_thread = None
+
+    @staticmethod
+    def _parse_jsonrpc_line(line: str) -> Optional[Dict[str, Any]]:
+        """Parse a single newline-delimited JSON-RPC line. Returns None on error."""
+        try:
+            msg = json.loads(line)
+        except json.JSONDecodeError:
+            logger.error("Invalid JSON from BAR MCP: %s", line[:200])
+            return None
+        if not isinstance(msg, dict):
+            return None
+        return msg
+
+    def _reader_loop(self) -> None:
+        """Background thread: read from socket, parse JSON-RPC lines, demultiplex by id.
+
+        Invariant: complete lines are always parsed from _buffer *before* calling
+        recv().  If a previous recv() returned two responses in one chunk, the
+        second sits in _buffer and is consumed immediately on the next loop
+        iteration — we never block on the network when data is already available.
+        """
+        logger.debug("BAR TCP reader thread started")
+        while self._reader_running:
+            try:
+                # --- Phase 1: parse any complete lines already in the buffer ---
+                parsed_line = False
+                while self._reader_running:
+                    nl_pos = self._buffer.find("\n")
+                    if nl_pos < 0:
+                        break
+                    line = self._buffer[:nl_pos]
+                    self._buffer = self._buffer[nl_pos + 1:]
+                    parsed_line = True
+
+                    if not line.strip():
+                        continue
+
+                    msg = self._parse_jsonrpc_line(line)
+                    if msg is None:
+                        continue
+
+                    resp_id = msg.get("id")
+                    if resp_id is not None:
+                        ev = self._pending.pop(int(resp_id), None)
+                        if ev:
+                            self._pending_results[int(resp_id)] = msg
+                            ev.set()
+                            logger.debug("BAR TCP ◄ response id=%s delivered", resp_id)
+                        else:
+                            logger.warning(
+                                "BAR TCP ◄ unsolicited response id=%s (no pending request)",
+                                resp_id,
+                            )
+                    else:
+                        logger.debug("BAR TCP ◄ notification or stray: %s", line[:100])
+
+                # --- Phase 2: recv only when no complete line was available ---
+                if self._sock and not parsed_line:
+                    try:
+                        chunk = self._sock.recv(4096)
+                    except socket.timeout:
+                        continue
+                    except OSError:
+                        break
+
+                    if not chunk:
+                        break
+
+                    self._buffer += chunk.decode("utf-8", errors="replace")
+                    # Loop back to Phase 1 to parse the newly appended data
+
+                # --- Phase 3: detect closed socket (only when idle) ---
+                if self._sock and self._buffer == "" and not parsed_line:
+                    # Socket exists but we got nothing and buffer is empty —
+                    # check if it was closed by attempting a zero-byte recv.
+                    pass  # timeout in Phase 2 will handle this on next iteration
+
+                if not self._sock:
+                    break
+
+            except Exception as exc:
+                logger.warning("BAR TCP reader thread error: %s", exc)
+                break
+
+        logger.debug("BAR TCP reader thread stopped")
+        # Notify any pending waiters that the connection is gone
+        for ev in self._pending.values():
+            self._pending_results[-1] = BarConnectionError(
+                "BAR MCP connection lost while waiting for response."
+            )
+            ev.set()
+        self._pending.clear()
+        self._pending_results.clear()
+
+    # ------------------------------------------------------------------
+    # Response waiting
+    # ------------------------------------------------------------------
+
+    def receive_response(self, request_id: int, timeout: float = 10.0) -> Dict[str, Any]:
+        """Wait for the JSON-RPC response matching a specific request ID.
+
+        Uses the background reader thread to demultiplex responses by ID.
+        Raises on timeout, connection loss, or parse error.
+        """
+        if not self.connected:
+            raise BarConnectionError("Not connected to BAR MCP")
+
+        return self._wait_for_response(request_id, timeout)
+
+    def _wait_for_response(self, request_id: int, timeout: float) -> Dict[str, Any]:
+        """Wait for the response matching a specific request ID.
+
+        Blocks until the reader thread delivers the matching response or
+        the timeout expires.
+        """
+        ev = threading.Event()
+        with self._lock:
+            self._pending[request_id] = ev
+
+        if not ev.wait(timeout=timeout):
+            with self._lock:
+                self._pending.pop(request_id, None)
+            raise BarConnectionError(
+                f"Timeout waiting for BAR MCP response id={request_id} after {timeout}s. "
+                f"Is dbg_bar_mcp.lua loaded? Check game console for '[BARMCP]' messages."
+            )
+
+        result = self._pending_results.pop(request_id, None)
+        if isinstance(result, BarConnectionError):
+            raise result
+        if result is None:
+            raise BarConnectionError(
+                f"No response received for BAR MCP request id={request_id}."
+            )
+        return result
+
     def reconnect(self) -> None:
         """Reconnect with exponential backoff.
 
         Raises BarConnectionError after exhausting all attempts.
         """
+        self._stop_reader()
         self._cleanup_sock()
+        # Clear pending requests so old waiters don't block forever
+        for ev in self._pending.values():
+            self._pending_results[-1] = BarConnectionError(
+                "Reconnecting — previous request cancelled."
+            )
+            ev.set()
+        self._pending.clear()
+        self._pending_results.clear()
+
         addr = f"{self._host}:{self._port}"
         last_error: Optional[Exception] = None
 
@@ -212,22 +389,20 @@ class BarTcpClient:
         if request_id is not None:
             msg["id"] = request_id
         else:
-            with self._lock:
-                msg["id"] = self._next_id()
+            msg["id"] = self._next_id()
             request_id = msg["id"]
 
         payload = json.dumps(msg) + "\n"
         logger.debug("BAR TCP ► %s", payload.rstrip())
 
-        with self._lock:
-            try:
-                if self._sock:
-                    self._sock.sendall(payload.encode("utf-8"))
-            except OSError as exc:
-                self._cleanup_sock()
-                raise BarConnectionError(
-                    f"Lost connection to BAR MCP while sending — {exc}"
-                ) from exc
+        try:
+            if self._sock:
+                self._sock.sendall(payload.encode("utf-8"))
+        except OSError as exc:
+            self._cleanup_sock()
+            raise BarConnectionError(
+                f"Lost connection to BAR MCP while sending — {exc}"
+            ) from exc
 
         return request_id
 
@@ -256,68 +431,6 @@ class BarTcpClient:
                     f"Lost connection to BAR MCP while sending notification — {exc}"
                 ) from exc
 
-    def receive_response(self, timeout: float = 10.0) -> Dict[str, Any]:
-        """Read the next JSON-RPC response from BAR MCP.
-
-        Buffers partial messages across calls. Raises on timeout or parse error.
-        """
-        if not self.connected:
-            raise BarConnectionError("Not connected to BAR MCP")
-
-        deadline = time.monotonic() + timeout
-
-        while True:
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                raise BarConnectionError(
-                    f"Timeout waiting for BAR MCP response after {timeout}s. "
-                    f"Is dbg_bar_mcp.lua loaded? Check game console for '[BARMCP]' messages."
-                )
-
-            # Set a short timeout so we can check the buffer after each read
-            with self._lock:
-                if self._sock:
-                    self._sock.settimeout(min(remaining, 1.0))
-                    try:
-                        chunk = self._sock.recv(4096)
-                    except socket.timeout:
-                        chunk = b""
-                    except OSError as exc:
-                        self._cleanup_sock()
-                        raise BarConnectionError(
-                            f"BAR MCP connection lost while reading — {exc}"
-                        ) from exc
-                    else:
-                        if chunk:
-                            logger.debug("BAR TCP ◄ (%d bytes)", len(chunk))
-                            self._buffer += chunk.decode("utf-8", errors="replace")
-                        else:
-                            # Empty read = connection closed
-                            self._cleanup_sock()
-                            raise BarConnectionError(
-                                "BAR MCP closed the connection unexpectedly."
-                            )
-
-            # Try to extract a complete line from the buffer
-            nl_pos = self._buffer.find("\n")
-            if nl_pos >= 0:
-                line = self._buffer[:nl_pos]
-                self._buffer = self._buffer[nl_pos + 1 :]
-
-                if line.strip():
-                    try:
-                        return json.loads(line)
-                    except json.JSONDecodeError as exc:
-                        logger.error(
-                            "Invalid JSON-RPC response from BAR MCP: %s — "
-                            "is dbg_bar_mcp.lua loaded? Check game console for '[BARMCP]' messages.",
-                            line[:200],
-                        )
-                        raise BarConnectionError(
-                            f"Invalid JSON from BAR MCP: {line[:200]}"
-                        ) from exc
-                # Skip empty lines; wait for more data
-
     # ------------------------------------------------------------------
     # High-level helpers
     # ------------------------------------------------------------------
@@ -325,13 +438,16 @@ class BarTcpClient:
     def call_method(
         self, method: str, params: Optional[Dict[str, Any]] = None, timeout: float = 30.0
     ) -> Dict[str, Any]:
-        """Send a JSON-RPC request and wait for the response.
+        """Send a JSON-RPC request and wait for the matching response.
+
+        Responses are matched by request ID via the background reader thread,
+        so out-of-order or stray responses are handled correctly.
 
         Returns the parsed JSON-RPC response dict.
         Raises BarConnectionError on transport or protocol errors.
         """
-        self.send_jsonrpc(method, params)
-        response = self.receive_response(timeout)
+        req_id = self.send_jsonrpc(method, params)
+        response = self.receive_response(req_id, timeout)
         logger.debug("BAR TCP ◄ response id=%s", response.get("id"))
         return response
 
@@ -461,16 +577,19 @@ class TracyConnectionError(Exception):
 
 
 class TracyHttpClient:
-    """HTTP client for Tracy MCP's SSE endpoint.
+    """Proper SSE client for Tracy MCP's FastMCP SSE transport.
 
-    Communicates with Tracy MCP via JSON-RPC over HTTP POST requests.
-    Tracy MCP uses FastMCP with SSE transport, which exposes a JSON-RPC
-    endpoint at /messages/?session_id=...
+    MCP SSE transport model:
+    1. Client opens a persistent GET /sse stream.
+    2. Server sends an 'endpoint' event with the message POST URL.
+    3. Client POSTs JSON-RPC messages to that URL.
+    4. Server sends responses back on the SSE stream as 'result' events.
+    5. Responses are demultiplexed by JSON-RPC request ID.
 
-    This client:
-    - Handles the SSE handshake (GET /sse to get session_id)
-    - Sends JSON-RPC requests via POST /messages/?session_id=...
-    - Parses SSE responses
+    This client maintains:
+    - A persistent SSE stream (background reader thread).
+    - Unique auto-incrementing request IDs.
+    - Response demultiplexing by ID (thread-safe, like BarTcpClient).
     """
 
     def __init__(
@@ -482,22 +601,40 @@ class TracyHttpClient:
         self._host = host
         self._port = port
         self._timeout = timeout
-        self._session_id: Optional[str] = None
         self._base_url = f"http://{host}:{port}"
         self._connected = False
 
+        # SSE session state
+        self._message_url: Optional[str] = None  # POST endpoint from 'endpoint' event
+        self._endpoint_event = threading.Event()  # signaled when endpoint received
+        self._request_id = 0
+
+        # Persistent SSE stream
+        self._sse_stream = None  # httpx.Response (streaming)
+        self._sse_context = None  # httpx._GeneratorContextManager (for cleanup)
+        self._sse_reader_running = False
+        self._sse_reader_thread: Optional[threading.Thread] = None
+
+        # Response demultiplexing: request_id -> threading.Event
+        self._lock = threading.Lock()
+        self._pending: Dict[int, threading.Event] = {}
+        self._pending_results: Dict[int, Any] = {}
+
     @property
     def connected(self) -> bool:
-        return self._connected and self._session_id is not None
+        return self._connected and self._message_url is not None
 
     @property
     def base_url(self) -> str:
         return self._base_url
 
     def connect(self) -> None:
-        """Establish connection to Tracy MCP via SSE handshake.
+        """Establish SSE session with Tracy MCP.
 
-        Raises TracyConnectionError if connection fails.
+        Opens /sse, reads the 'endpoint' event to get the message URL,
+        then starts the background SSE reader thread.
+
+        Raises TracyConnectionError if the handshake fails.
         """
         addr = f"{self._host}:{self._port}"
         logger.info("Connecting to Tracy MCP on %s …", addr)
@@ -510,42 +647,19 @@ class TracyHttpClient:
                 "Install with: pip install httpx"
             )
 
-        # SSE handshake: GET /sse returns event stream with session_id
+        # Import httpx once and cache it
+        self._httpx = httpx
+
+        # Open persistent SSE stream (httpx.stream returns a context manager)
         try:
-            # Use a streaming request to avoid hanging on the long-lived SSE connection
-            with httpx.stream("GET", f"{self._base_url}/sse", timeout=self._timeout, headers={"Accept": "text/event-stream"}) as response:
-                if response.status_code != 200:
-                    raise TracyConnectionError(
-                        f"Tracy MCP SSE handshake failed with status {response.status_code}. "
-                        f"Is Tracy MCP running on {addr}?"
-                    )
-
-                # Read the first few chunks of the stream to find the session_id
-                text = ""
-                for line in response.iter_lines():
-                    text += line + "\n"
-                    if "session_id=" in line:
-                        break
-                
-                if "session_id" not in text:
-                    raise TracyConnectionError(
-                        f"Tracy MCP SSE response missing session_id: {text[:200]}"
-                    )
-
-                # Extract session_id from the response
-                import re
-                match = re.search(r'session_id=([a-zA-Z0-9_-]+)', text)
-                if not match:
-                    raise TracyConnectionError(
-                        f"Could not parse session_id from Tracy MCP SSE response"
-                    )
-
-                self._session_id = match.group(1)
-                self._connected = True
-                logger.info(
-                    "Connected to Tracy MCP on %s (session: %s)", addr, self._session_id[:8]
-                )
-
+            self._sse_context = self._httpx.stream(
+                "GET",
+                f"{self._base_url}/sse",
+                timeout=self._timeout,
+                headers={"Accept": "text/event-stream"},
+            )
+            # Enter the context manager to get the actual Response object
+            self._sse_stream = self._sse_context.__enter__()
         except TracyConnectionError:
             raise
         except Exception as exc:
@@ -555,12 +669,229 @@ class TracyHttpClient:
                 f"TracyServerBindings are built. Detail: {exc}"
             ) from exc
 
+        # Start background SSE reader thread (it will detect the endpoint event)
+        self._start_sse_reader()
+
+        # Wait for the endpoint event from the reader thread
+        if not self._endpoint_event.wait(timeout=self._timeout):
+            self._stop_sse_reader()
+            self._cleanup_sse()
+            raise TracyConnectionError(
+                f"Tracy MCP SSE handshake failed — no 'endpoint' event received within {self._timeout}s. "
+                f"Is Tracy MCP running on {addr}?"
+            )
+
+        if not self._message_url:
+            self._stop_sse_reader()
+            self._cleanup_sse()
+            raise TracyConnectionError(
+                f"Tracy MCP SSE handshake failed — endpoint event had no URL. "
+                f"Is Tracy MCP running on {addr}?"
+            )
+
+        # Mark connected now so send_request() passes its self.connected check
+        # for the MCP initialize handshake below.
+        self._connected = True
+
+        # Make sure message_url is absolute
+        if not self._message_url.startswith("http"):
+            self._message_url = f"{self._base_url}{self._message_url}"
+
+        # MCP handshake: initialize request, then initialized notification
+        try:
+            init_params = {
+                "protocolVersion": "2025-11-25",
+                "capabilities": {},
+                "clientInfo": {"name": "bar_tracy_bridge", "version": "1.0.0"},
+            }
+            init_response = self.send_request("initialize", init_params, timeout=5.0)
+
+            if "error" in init_response:
+                logger.warning(
+                    "Tracy MCP initialize error: %s",
+                    init_response["error"].get("message", "unknown"),
+                )
+            else:
+                logger.info(
+                    "Tracy MCP initialized (protocol: %s)",
+                    init_response.get("result", {}).get("protocolVersion"),
+                )
+
+            # Send initialized notification (no response expected)
+            self._send_notification("notifications/initialized")
+        except TracyConnectionError as exc:
+            logger.warning("Tracy MCP initialize failed (non-fatal): %s", exc)
+
+        logger.info("Connected to Tracy MCP on %s (endpoint: %s)", addr, self._message_url)
+
+    @staticmethod
+    def _parse_sse_event(text: str) -> tuple:
+        """Parse an SSE event block into (event_type, data).
+
+        SSE format:
+            event: <type>\n
+            data: <json>\n
+            \n
+        """
+        event_type = "message"  # default event type
+        data = ""
+
+        for line in text.split("\n"):
+            if line.startswith("event: "):
+                event_type = line[7:].strip()
+            elif line.startswith("data: "):
+                data = line[6:].strip()
+
+        return event_type, data
+
     def disconnect(self) -> None:
-        """Close the SSE session."""
+        """Close the SSE session and stop the reader thread."""
         if self._connected:
             logger.info("Disconnecting from Tracy MCP")
-            self._session_id = None
-            self._connected = False
+        self._stop_sse_reader()
+        self._cleanup_sse()
+        self._connected = False
+        self._message_url = None
+
+    def _cleanup_sse(self) -> None:
+        """Close the SSE stream and clean up resources."""
+        if self._sse_context:
+            try:
+                self._sse_context.__exit__(None, None, None)
+            except Exception:
+                pass
+            self._sse_context = None
+        self._sse_stream = None
+
+    # ------------------------------------------------------------------
+    # Background SSE reader thread
+    # ------------------------------------------------------------------
+
+    def _start_sse_reader(self) -> None:
+        """Start the background SSE reader thread."""
+        if self._sse_reader_running and self._sse_reader_thread and self._sse_reader_thread.is_alive():
+            return
+        self._sse_reader_running = True
+        self._sse_reader_thread = threading.Thread(
+            target=self._sse_reader_loop, daemon=True, name="tracy-sse-reader"
+        )
+        self._sse_reader_thread.start()
+
+    def _stop_sse_reader(self) -> None:
+        """Signal the SSE reader thread to stop and wait for it."""
+        self._sse_reader_running = False
+        if self._sse_reader_thread and self._sse_reader_thread.is_alive():
+            self._sse_reader_thread.join(timeout=5.0)
+        self._sse_reader_thread = None
+
+    def _sse_reader_loop(self) -> None:
+        """Background thread: read SSE events and demultiplex responses by ID."""
+        logger.debug("Tracy SSE reader thread started")
+
+        if not self._sse_stream:
+            logger.error("No SSE stream available for reader")
+            return
+
+        buffer = ""
+        try:
+            for line in self._sse_stream.iter_lines():
+                if not self._sse_reader_running:
+                    break
+
+                buffer += line + "\n"
+
+                # Parse complete SSE events
+                while "\n\n" in buffer:
+                    event_text, _, buffer = buffer.partition("\n\n")
+                    event_type, data = self._parse_sse_event(event_text)
+
+                    if event_type == "endpoint":
+                        # First endpoint event — store URL and signal connect()
+                        if not self._message_url:
+                            self._message_url = data.strip()
+                            logger.debug("Tracy SSE ► endpoint event: %s", self._message_url)
+                            self._endpoint_event.set()
+                        else:
+                            logger.debug("Tracy SSE ► duplicate endpoint: %s", data)
+                    elif event_type == "result":
+                        # This is a JSON-RPC response
+                        self._handle_sse_response(data)
+                    elif event_type == "error":
+                        logger.warning("Tracy SSE ► error event: %s", data[:200])
+                    else:
+                        logger.debug("Tracy SSE ► event [%s]: %s", event_type, data[:100])
+
+        except Exception as exc:
+            logger.warning("Tracy SSE reader thread error: %s", exc)
+        finally:
+            # Notify any pending waiters that the connection is gone
+            for ev in self._pending.values():
+                self._pending_results[-1] = TracyConnectionError(
+                    "Tracy MCP SSE connection lost while waiting for response."
+                )
+                ev.set()
+            self._pending.clear()
+            self._pending_results.clear()
+            logger.debug("Tracy SSE reader thread stopped")
+
+    def _handle_sse_response(self, data: str) -> None:
+        """Parse an SSE 'result' event and deliver to the waiting request."""
+        try:
+            msg = json.loads(data)
+        except json.JSONDecodeError:
+            logger.error("Tracy SSE ► invalid JSON: %s", data[:200])
+            return
+
+        if not isinstance(msg, dict):
+            logger.warning("Tracy SSE ► non-dict response: %s", data[:100])
+            return
+
+        resp_id = msg.get("id")
+        if resp_id is not None:
+            with self._lock:
+                ev = self._pending.pop(int(resp_id), None)
+                if ev:
+                    self._pending_results[int(resp_id)] = msg
+                    ev.set()
+                    logger.debug("Tracy SSE ◄ response id=%s delivered", resp_id)
+                else:
+                    logger.warning(
+                        "Tracy SSE ◄ unsolicited response id=%s (no pending request)",
+                        resp_id,
+                    )
+        else:
+            logger.debug("Tracy SSE ◄ notification or stray: %s", data[:100])
+
+    # ------------------------------------------------------------------
+    # JSON-RPC messaging
+    # ------------------------------------------------------------------
+
+    def _next_id(self) -> int:
+        """Generate the next unique request ID."""
+        self._request_id += 1
+        return self._request_id
+
+    def _wait_for_response(self, request_id: int, timeout: float) -> Dict[str, Any]:
+        """Wait for the SSE response matching a specific request ID."""
+        ev = threading.Event()
+        with self._lock:
+            self._pending[request_id] = ev
+
+        if not ev.wait(timeout=timeout):
+            with self._lock:
+                self._pending.pop(request_id, None)
+            raise TracyConnectionError(
+                f"Timeout waiting for Tracy MCP response id={request_id} after {timeout}s."
+            )
+
+        result = self._pending_results.pop(request_id, None)
+        if isinstance(result, TracyConnectionError):
+            raise result
+        if result is None:
+            raise TracyConnectionError(
+                f"No response received for Tracy MCP request id={request_id}."
+            )
+        return result
 
     def send_request(
         self,
@@ -568,9 +899,12 @@ class TracyHttpClient:
         params: Optional[Dict[str, Any]] = None,
         timeout: Optional[float] = None,
     ) -> Dict[str, Any]:
-        """Send a JSON-RPC request to Tracy MCP and wait for response.
+        """Send a JSON-RPC request to Tracy MCP and wait for SSE response.
 
-        Returns the parsed response dict.
+        POSTs to the message endpoint, then waits for the matching 'result'
+        event on the SSE stream.
+
+        Returns the parsed JSON-RPC response dict.
         Raises TracyConnectionError on transport or protocol errors.
         """
         if not self.connected:
@@ -579,57 +913,64 @@ class TracyHttpClient:
                 "Is Tracy MCP running?"
             )
 
-        import httpx
-
+        req_id = self._next_id()
         msg: Dict[str, Any] = {
             "jsonrpc": "2.0",
             "method": method,
-            "id": 1,  # Tracy MCP doesn't seem to use IDs for matching
+            "id": req_id,
         }
         if params is not None:
             msg["params"] = params
 
-        url = f"{self._base_url}/messages/?session_id={self._session_id}"
         req_timeout = timeout or self._timeout
 
-        logger.debug("Tracy HTTP ► %s", json.dumps(msg))
+        logger.debug("Tracy SSE ► POST id=%s method=%s", req_id, method)
 
         try:
-            response = httpx.post(
-                url,
+            # POST to the message endpoint (fire-and-forget, response comes via SSE)
+            resp = self._httpx.post(
+                self._message_url,
                 json=msg,
                 timeout=req_timeout,
-                headers={"Accept": "text/event-stream"},
             )
 
-            if response.status_code != 200:
-                raise TracyConnectionError(
-                    f"Tracy MCP HTTP error {response.status_code}: {response.text[:200]}"
+            if resp.status_code not in (200, 202):
+                logger.error(
+                    "Tracy SSE POST failed with status %d: %s",
+                    resp.status_code, resp.text[:200],
                 )
+                # Don't raise yet — the response might still arrive via SSE
+                # Fall through to wait_for_response
 
-            # Parse SSE response
-            # Format: event: result\ndata: {...}\n\n
-            text = response.text
-            data_match = re.search(r'data:\s*(\{.*\})', text, re.DOTALL)
-            if not data_match:
-                raise TracyConnectionError(
-                    f"Tracy MCP response missing data: {text[:200]}"
-                )
-
-            result = json.loads(data_match.group(1))
-            logger.debug("Tracy HTTP ◄ %s", json.dumps(result)[:200])
-            return result
-
-        except TracyConnectionError:
-            raise
-        except json.JSONDecodeError as exc:
-            raise TracyConnectionError(
-                f"Invalid JSON from Tracy MCP: {exc}"
-            ) from exc
         except Exception as exc:
-            raise TracyConnectionError(
-                f"Tracy MCP request failed: {exc}"
-            ) from exc
+            logger.warning("Tracy SSE POST error: %s", exc)
+            # Fall through to wait_for_response — might still arrive
+
+        # Wait for response on SSE stream
+        return self._wait_for_response(req_id, req_timeout)
+
+    def _send_notification(self, method: str, params: Optional[Dict[str, Any]] = None) -> None:
+        """Send a JSON-RPC 2.0 notification to Tracy MCP (no id, no response expected)."""
+        if not self.connected:
+            raise TracyConnectionError("Not connected to Tracy MCP")
+
+        msg: Dict[str, Any] = {
+            "jsonrpc": "2.0",
+            "method": method,
+        }
+        if params is not None:
+            msg["params"] = params
+
+        logger.debug("Tracy SSE ► (notification) %s", json.dumps(msg)[:200])
+
+        try:
+            self._httpx.post(
+                self._message_url,
+                json=msg,
+                timeout=self._timeout,
+            )
+        except Exception as exc:
+            logger.warning("Tracy SSE notification POST error: %s", exc)
 
     def call_tool(
         self,
@@ -1250,18 +1591,37 @@ def _create_bar_tools_server(
 
     server = fastmcp.FastMCP("BAR+Tracy Bridge")
 
-    # Initialize BAR MCP connection
-    bar_client.send_notification("initialize", {
+    # MCP handshake: initialize is a request (with id), then send initialized notification.
+    # The Lua server replies using msg.id, so we must send a proper request and validate the response id.
+    init_params = {
         "protocolVersion": "2025-11-25",
         "capabilities": {},
         "clientInfo": {"name": "bar_tracy_bridge", "version": "1.0.0"},
-    })
-    # Consume the initialize response
+    }
     try:
-        bar_client.receive_response(timeout=5.0)
-    except BarConnectionError:
-        logger.warning("No response to initialize notification (non-fatal)")
+        init_req_id = bar_client.send_jsonrpc("initialize", init_params)
+        init_response = bar_client.receive_response(init_req_id, timeout=5.0)
 
+        # Validate that the response id matches our request id
+        if init_response.get("id") != init_req_id:
+            logger.warning(
+                "BAR MCP initialize response id mismatch: expected %s, got %s",
+                init_req_id, init_response.get("id"),
+            )
+
+        # Check for JSON-RPC error in the response
+        if "error" in init_response:
+            logger.warning(
+                "BAR MCP initialize error: %s",
+                init_response["error"].get("message", "unknown"),
+            )
+        else:
+            logger.info("BAR MCP initialized successfully (protocol: %s)", init_response.get("result", {}).get("protocolVersion"))
+
+    except BarConnectionError as exc:
+        logger.warning("No response to initialize request (non-fatal): %s", exc)
+
+    # Now send the initialized notification (no id, no response expected)
     bar_client.send_notification("notifications/initialized")
 
     # Discover BAR tools
@@ -1270,42 +1630,116 @@ def _create_bar_tools_server(
     except BarConnectionError as exc:
         logger.error("Failed to discover BAR tools: %s", exc)
 
+    # ------------------------------------------------------------------
+    # Helper: build a Python type hint string from a JSON Schema type
+    # ------------------------------------------------------------------
+    def _schema_type_to_python(t: str) -> str:
+        if t == "string":
+            return "str"
+        if t == "integer":
+            return "int"
+        if t == "number":
+            return "float"
+        if t == "boolean":
+            return "bool"
+        return "Any"
+
+    # ------------------------------------------------------------------
+    # Helper: build a default-value string from a JSON Schema property
+    # ------------------------------------------------------------------
+    def _schema_default(prop: Dict[str, Any], py_type: str) -> str:
+        if "default" in prop:
+            return json.dumps(prop["default"])
+        # Heuristic defaults
+        if py_type == "str":
+            return '""'
+        if py_type == "int":
+            return "0"
+        if py_type == "float":
+            return "0.0"
+        if py_type == "bool":
+            return "False"
+        return "None"
+
+    # ------------------------------------------------------------------
     # Register each BAR tool as an MCP tool on the bridge server
+    # ------------------------------------------------------------------
+    # We generate a real Python function per tool with:
+    #   - __name__ == tool_name  (so FastMCP picks up the correct name)
+    #   - typed parameters from inputSchema  (so FastMCP exposes a real schema)
+    #   - proper docstring
+    # This avoids the "all tools named handler" bug and **kwargs schema loss.
     for tool_def in bar_registry.tools:
         tool_name = tool_def["name"]
         tool_desc = tool_def.get("description", "")
+        input_schema = tool_def.get("inputSchema", {})
+        properties = input_schema.get("properties", {})
+        # Some tools may have properties as a list or missing — normalize to dict
+        if not isinstance(properties, dict):
+            properties = {}
+        required = set(input_schema.get("required", []))
 
-        def make_handler(tname: str, tdesc: str):
-            """Factory that creates a handler with the correct closure values."""
-            # Build the docstring
-            docstring = tdesc
+        # Build parameter list:  name: type = default
+        # Required params must come before optional ones (Python syntax rule)
+        params: List[str] = []
+        annotations: Dict[str, str] = {}
+        for pname, prop in properties.items():
+            raw_type = prop.get("type", "string")
+            py_type = _schema_type_to_python(raw_type)
+            annotations[pname] = py_type
+            default = _schema_default(prop, py_type)
+            if pname in required:
+                params.append((pname, f"{pname}: {py_type}", True))
+            else:
+                params.append((pname, f"{pname}: {py_type} = {default}", False))
+        # Sort: required (True) first, then optional (False)
+        params.sort(key=lambda x: (not x[2], x[0]))
+        param_signatures = [p[1] for p in params]
 
-            def handler(**kwargs):
-                """Dynamic BAR tool handler."""
-                handler.__doc__ = docstring
-                try:
-                    return bar_registry.call_tool(tname, kwargs)
-                except BarConnectionError as exc:
-                    # Try reconnect and retry once
-                    logger.warning("BAR tool '%s' failed, attempting reconnect: %s", tname, exc)
-                    try:
-                        bar_client.reconnect()
-                        bar_registry.discover()
-                        return bar_registry.call_tool(tname, kwargs)
-                    except BarConnectionError as exc2:
-                        raise BarConnectionError(
-                            f"BAR tool '{tname}' failed after reconnect: {exc2}"
-                        ) from exc2
-            return handler
+        # Build source for a real function with typed signature
+        param_str = ", ".join(param_signatures) if param_signatures else ""
+        # Extract just param names to build the _args dict literal
+        param_names = [p[0] for p in params]
+        kwargs_expr = "{" + ", ".join(param_names) + "}" if param_names else "{}"
 
-        handler = make_handler(tool_name, tool_desc)
-
-        # Register with FastMCP — use the schema from BAR directly
+        func_source = f'''
+def {tool_name}({param_str}) -> str:
+    """{tool_desc}"""
+    _args = {kwargs_expr}
+    try:
+        return bar_registry.call_tool({tool_name!r}, _args)
+    except BarConnectionError as exc:
+        logger.warning("BAR tool '%s' failed, attempting reconnect: %s", {tool_name!r}, exc)
         try:
-            server.tool(description=tool_desc)(handler)
-            logger.info("Registered BAR tool: %s", tool_name)
+            bar_client.reconnect()
+            bar_registry.discover()
+            return bar_registry.call_tool({tool_name!r}, _args)
+        except BarConnectionError as exc2:
+            raise BarConnectionError(
+                f"BAR tool '{tool_name}' failed after reconnect: {{exc2}}"
+            ) from exc2
+'''
+        try:
+            namespace: Dict[str, Any] = {
+                "bar_registry": bar_registry,
+                "bar_client": bar_client,
+                "BarConnectionError": BarConnectionError,
+                "logger": logger,
+            }
+            exec(func_source, namespace)
+            func = namespace[tool_name]
+
+            # Set proper metadata
+            func.__name__ = tool_name
+            func.__doc__ = tool_desc
+            func.__annotations__["return"] = str
+            func.__annotations__.update(annotations)
+
+            # Register with FastMCP using explicit name
+            server.tool(tool_name, description=tool_desc)(func)
+            logger.info("Registered BAR tool: %s (params: %s)", tool_name, param_str or "(none)")
         except Exception as reg_err:
-            logger.error("Failed to register BAR tool '%s': %s", tool_name, reg_err)
+            logger.error("Failed to register BAR tool '%s': %s\nSource:\n%s", tool_name, reg_err, func_source)
 
     # ------------------------------------------------------------------
     # Phase 2.3 — Pass-through Tracy tools
