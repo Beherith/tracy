@@ -58,7 +58,7 @@ _stderr_handler = logging.StreamHandler(sys.stderr)
 _stderr_handler.setFormatter(formatter)
 logger.addHandler(_stderr_handler)
 
-_file_handler = logging.FileHandler(os.path.join(_HERE, "bar_tracy_bridge.log"))
+_file_handler = logging.FileHandler(os.path.join(_HERE, "bar_tracy_bridge.log"), encoding="utf-8")
 _file_handler.setFormatter(formatter)
 logger.addHandler(_file_handler)
 
@@ -232,14 +232,14 @@ class BarTcpClient:
                         if ev:
                             self._pending_results[int(resp_id)] = msg
                             ev.set()
-                            logger.debug("BAR TCP ◄ response id=%s delivered", resp_id)
+                            logger.debug("BAR TCP <- response id=%s delivered", resp_id)
                         else:
                             logger.warning(
-                                "BAR TCP ◄ unsolicited response id=%s (no pending request)",
+                                "BAR TCP <- unsolicited response id=%s (no pending request)",
                                 resp_id,
                             )
                     else:
-                        logger.debug("BAR TCP ◄ notification or stray: %s", line[:100])
+                        logger.debug("BAR TCP <- notification or stray: %s", line[:100])
 
                 # --- Phase 2: recv only when no complete line was available ---
                 if self._sock and not parsed_line:
@@ -322,10 +322,7 @@ class BarTcpClient:
         return result
 
     def reconnect(self) -> None:
-        """Reconnect with exponential backoff.
-
-        Raises BarConnectionError after exhausting all attempts.
-        """
+        """Reconnect with exponential backoff indefinitely."""
         self._stop_reader()
         self._cleanup_sock()
         # Clear pending requests so old waiters don't block forever
@@ -338,27 +335,22 @@ class BarTcpClient:
         self._pending_results.clear()
 
         addr = f"{self._host}:{self._port}"
-        last_error: Optional[Exception] = None
-
-        for attempt in range(1, self._reconnect_max + 1):
-            wait = self._reconnect_base * (2 ** (attempt - 1))
+        attempt = 1
+        while True:
+            wait = min(self._reconnect_base * (2 ** (attempt - 1)), 60.0)
             logger.warning(
-                "Reconnect attempt %d/%d to BAR MCP on %s (waiting %.1fs) …",
-                attempt, self._reconnect_max, addr, wait,
+                "Reconnect attempt %d to BAR MCP on %s (waiting %.1fs) …",
+                attempt, addr, wait,
             )
             time.sleep(wait)
 
             try:
                 self.connect()
+                logger.info("Successfully reconnected to BAR MCP on %s", addr)
                 return  # success
             except BarConnectionError as exc:
-                last_error = exc
                 logger.warning("Reconnect attempt %d failed: %s", attempt, exc)
-
-        raise BarConnectionError(
-            f"Failed to reconnect to BAR MCP on {addr} after {self._reconnect_max} attempts. "
-            f"Last error: {last_error}"
-        ) from last_error
+                attempt += 1
 
     # ------------------------------------------------------------------
     # JSON-RPC messaging
@@ -397,7 +389,7 @@ class BarTcpClient:
             request_id = msg["id"]
 
         payload = json.dumps(msg) + "\n"
-        logger.debug("BAR TCP ► %s", payload.rstrip())
+        logger.debug("BAR TCP -> %s", payload.rstrip())
 
         try:
             if self._sock:
@@ -423,7 +415,7 @@ class BarTcpClient:
             msg["params"] = params
 
         payload = json.dumps(msg) + "\n"
-        logger.debug("BAR TCP ► (notification) %s", payload.rstrip())
+        logger.debug("BAR TCP -> (notification) %s", payload.rstrip())
 
         with self._lock:
             try:
@@ -452,7 +444,7 @@ class BarTcpClient:
         """
         req_id = self.send_jsonrpc(method, params)
         response = self.receive_response(req_id, timeout)
-        logger.debug("BAR TCP ◄ response id=%s", response.get("id"))
+        logger.debug("BAR TCP <- response id=%s", response.get("id"))
         return response
 
     def call_tool(self, tool_name: str, arguments: Optional[Dict[str, Any]] = None, timeout: float = 30.0) -> Dict[str, Any]:
@@ -607,6 +599,9 @@ class TracyHttpClient:
         self._timeout = timeout
         self._base_url = f"http://{host}:{port}"
         self._connected = False
+
+        # Connection lock to prevent concurrent reconnection attempts
+        self._conn_lock = threading.Lock()
 
         # SSE session state
         self._message_url: Optional[str] = None  # POST endpoint from 'endpoint' event
@@ -763,6 +758,22 @@ class TracyHttpClient:
         self._connected = False
         self._message_url = None
 
+    def reconnect(self) -> None:
+        """Attempt to reconnect to Tracy MCP indefinitely."""
+        attempt = 1
+        while True:
+            try:
+                with self._conn_lock:
+                    self.disconnect()
+                    self.connect()
+                logger.info("Successfully reconnected to Tracy MCP")
+                return
+            except TracyConnectionError as exc:
+                wait = min(1.0 * (2 ** (attempt - 1)), 60.0)
+                logger.warning("Tracy MCP reconnect attempt %d failed: %s (waiting %.1fs)", attempt, exc, wait)
+                time.sleep(wait)
+                attempt += 1
+
     def _cleanup_sse(self) -> None:
         """Close the SSE stream and clean up resources."""
         if self._sse_context:
@@ -827,12 +838,12 @@ class TracyHttpClient:
                         # FastMCP (MCP Python SDK) sends JSON-RPC responses as
                         # 'event: message'.  Handle both 'message' and 'result'
                         # for forward compatibility.
-                        logger.debug("Tracy SSE ◄ %s event, data=%s", event_type, data[:200])
+                        logger.debug("Tracy SSE <- %s event, data=%s", event_type, data[:200])
                         self._handle_sse_response(data)
                     elif event_type == "error":
-                        logger.warning("Tracy SSE ► error event: %s", data[:200])
+                        logger.warning("Tracy SSE -> error event: %s", data[:200])
                     else:
-                        logger.debug("Tracy SSE ► event [%s]: %s", event_type, data[:100])
+                        logger.debug("Tracy SSE -> event [%s]: %s", event_type, data[:100])
 
         except Exception as exc:
             logger.warning("Tracy SSE reader thread error: %s", exc)
@@ -849,14 +860,16 @@ class TracyHttpClient:
 
     def _handle_sse_response(self, data: str) -> None:
         """Parse an SSE 'result' event and deliver to the waiting request."""
+        if not data.strip():
+            return
         try:
             msg = json.loads(data)
         except json.JSONDecodeError:
-            logger.error("Tracy SSE ► invalid JSON: %s", data[:200])
+            logger.error("Tracy SSE -> invalid JSON: %s", data[:200])
             return
 
         if not isinstance(msg, dict):
-            logger.warning("Tracy SSE ► non-dict response: %s", data[:100])
+            logger.warning("Tracy SSE -> non-dict response: %s", data[:100])
             return
 
         resp_id = msg.get("id")
@@ -866,14 +879,14 @@ class TracyHttpClient:
                 if ev:
                     self._pending_results[int(resp_id)] = msg
                     ev.set()
-                    logger.debug("Tracy SSE ◄ response id=%s delivered", resp_id)
+                    logger.debug("Tracy SSE <- response id=%s delivered", resp_id)
                 else:
                     logger.warning(
-                        "Tracy SSE ◄ unsolicited response id=%s (no pending request)",
+                        "Tracy SSE <- unsolicited response id=%s (no pending request)",
                         resp_id,
                     )
         else:
-            logger.debug("Tracy SSE ◄ notification or stray: %s", data[:100])
+            logger.debug("Tracy SSE <- notification or stray: %s", data[:100])
 
     # ------------------------------------------------------------------
     # JSON-RPC messaging
@@ -937,7 +950,7 @@ class TracyHttpClient:
 
         req_timeout = timeout or self._timeout
 
-        logger.debug("Tracy SSE ► POST id=%s method=%s", req_id, method)
+        logger.debug("Tracy SSE -> POST id=%s method=%s", req_id, method)
 
         try:
             # POST to the message endpoint (fire-and-forget, response comes via SSE)
@@ -974,7 +987,7 @@ class TracyHttpClient:
         if params is not None:
             msg["params"] = params
 
-        logger.debug("Tracy SSE ► (notification) %s", json.dumps(msg)[:200])
+        logger.debug("Tracy SSE -> (notification) %s", json.dumps(msg)[:200])
 
         try:
             self._httpx.post(
@@ -1757,9 +1770,9 @@ def _create_bar_tools_server(
             annotations[pname] = py_type
             default = _schema_default(prop, py_type)
             if pname in required:
-                params.append((pname, f"{pname}: {py_type}", True))
+                params.append(( pname, f"{pname}: {py_type}", True))
             else:
-                params.append((pname, f"{pname}: {py_type} = {default}", False))
+                params.append(( pname, f"{pname}: {py_type} = {default}", False))
         # Sort: required (True) first, then optional (False)
         params.sort(key=lambda x: (not x[2], x[0]))
         param_signatures = [p[1] for p in params]
@@ -1813,7 +1826,7 @@ def {tool_name}({param_str}) -> str:
     # Phase 2.3 — Pass-through Tracy tools
     # ------------------------------------------------------------------
     if tracy_client and tracy_client.connected:
-        logger.info("Registering Tracy pass-through tools")
+        logger.info("Registering Tracy pass-through tools (connection status: %s)", tracy_client.connected)
 
         # tracy_eval — execute Python code against a Tracy Worker
         @server.tool(
@@ -1837,9 +1850,17 @@ def {tool_name}({param_str}) -> str:
                 )
                 return str(result) if result is not None else ""
             except TracyConnectionError as exc:
-                raise TracyConnectionError(
-                    f"Tracy eval failed: {exc}"
-                ) from exc
+                logger.warning("Tracy eval failed, attempting reconnect: %s", exc)
+                tracy_client.reconnect()
+                try:
+                    result = tracy_client.call_tool(
+                        "eval",
+                        {"code": code, "instance_id": target_id},
+                        timeout=60.0,
+                    )
+                    return str(result) if result is not None else ""
+                except TracyConnectionError as exc2:
+                    raise TracyConnectionError(f"Tracy eval failed after reconnect: {exc2}") from exc2
 
         # list_instances — list loaded Tracy instances
         @server.tool(
@@ -1851,9 +1872,13 @@ def {tool_name}({param_str}) -> str:
                 result = tracy_client.call_tool("list_instances")
                 return json.dumps(result) if result else "[]"
             except TracyConnectionError as exc:
-                raise TracyConnectionError(
-                    f"Tracy list_instances failed: {exc}"
-                ) from exc
+                logger.warning("Tracy list_instances failed, attempting reconnect: %s", exc)
+                tracy_client.reconnect()
+                try:
+                    result = tracy_client.call_tool("list_instances")
+                    return json.dumps(result) if result else "[]"
+                except TracyConnectionError as exc2:
+                    raise TracyConnectionError(f"Tracy list_instances failed after reconnect: {exc2}") from exc2
 
         # discover_instances — scan for running Tracy applications
         @server.tool(
@@ -1870,9 +1895,15 @@ def {tool_name}({param_str}) -> str:
                 )
                 return json.dumps(result) if result else "[]"
             except TracyConnectionError as exc:
-                raise TracyConnectionError(
-                    f"Tracy discover_instances failed: {exc}"
-                ) from exc
+                logger.warning("Tracy discover_instances failed, attempting reconnect: %s", exc)
+                tracy_client.reconnect()
+                try:
+                    result = tracy_client.call_tool(
+                        "discover_instances", {"port_range": port_range}
+                    )
+                    return json.dumps(result) if result else "[]"
+                except TracyConnectionError as exc2:
+                    raise TracyConnectionError(f"Tracy discover_instances failed after reconnect: {exc2}") from exc2
 
         logger.info("Tracy tools registered: eval, list_instances, discover_instances")
 
@@ -1999,7 +2030,7 @@ def main() -> None:
         except TracyConnectionError as exc:
             logger.warning("Tracy MCP connection failed (non-fatal): %s", exc)
             logger.warning("BAR tools will still work without Tracy")
-            tracy_client = None
+
     else:
         logger.info("Tracy MCP not available — BAR tools only mode")
 
@@ -2009,15 +2040,18 @@ def main() -> None:
     bar_client = BarTcpClient(BAR_HOST, BAR_PORT)
     bar_registry = BarToolRegistry(bar_client)
 
-    try:
-        bar_client.connect()
-    except BarConnectionError as exc:
-        logger.error("FATAL: %s", exc)
-        logger.error(
-            "Tip: Make sure the game is running with dev mode enabled "
-            "(Spring.Utilities.IsDevMode() == true) and dbg_bar_mcp.lua is loaded."
-        )
-        sys.exit(1)
+    while True:
+        try:
+            bar_client.connect()
+            break
+        except BarConnectionError as exc:
+            logger.error("BAR MCP connection failed: %s", exc)
+            logger.error(
+                "Tip: Make sure the game is running with dev mode enabled "
+                "(Spring.Utilities.IsDevMode() == true) and dbg_bar_mcp.lua is loaded."
+            )
+            logger.info("Retrying connection in 5s...")
+            time.sleep(5)
 
     # Create the FastMCP server with BAR + Tracy tools
     server = _create_bar_tools_server(

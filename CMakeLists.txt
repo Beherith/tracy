@@ -3,7 +3,7 @@ cmake_minimum_required(VERSION 3.10)
 # Run version helper script
 include(cmake/version.cmake)
 
-project(Tracy LANGUAGES CXX VERSION ${TRACY_VERSION_STRING})
+project(Tracy LANGUAGES C CXX VERSION ${TRACY_VERSION_STRING})
 
 file(GENERATE OUTPUT .gitignore CONTENT "*")
 

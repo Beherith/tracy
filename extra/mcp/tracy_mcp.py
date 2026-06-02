@@ -212,12 +212,13 @@ def _cleanup_pid_files() -> None:
 
 # Attempt to import Tracy Server bindings
 try:
-    import TracyServerBindings as tracy_server
+    from tracy_client import TracyServerBindings as tracy_server
 except ImportError:
     sys.path.append(os.path.join(os.path.dirname(__file__), "../../build/python"))
     try:
         import TracyServerBindings as tracy_server
     except ImportError:
+        logger.warning("Tracy Server bindings not found; live connection and capture loading will be unavailable.")
         tracy_server = None
 
 mcp_server = fastmcp.FastMCP("Tracy Profiler")

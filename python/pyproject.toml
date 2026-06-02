@@ -26,4 +26,6 @@ wheel.packages = ["tracy_client"]
 [tool.scikit-build.cmake.define]
 TRACY_CLIENT_PYTHON = "ON"
 TRACY_STATIC = "OFF"
-CMAKE_INSTALL_BINDIR = ""
+CMAKE_INSTALL_BINDIR = "."
+CMAKE_INSTALL_LIBDIR = "lib"
+CMAKE_INSTALL_INCLUDEDIR = "include"
