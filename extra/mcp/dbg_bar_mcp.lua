@@ -89,11 +89,10 @@ local MCP_PORT    = 23452
 local MCP_HOST    = "127.0.0.1"
 local MCP_VERSION = "2025-11-25"
 local VFS_CAP     = 512 * 1024 -- 512 KB read cap
-local MCP_MAX_BUFFER = 1024 * 1024 -- 1 MB max buffer
 
 local Json   = Json or VFS.Include("common/luaUtilities/json.lua")
 local spEcho = Spring.Echo
-
+local debugMode = true
 --------------------------------------------------------------------------------
 -- Socket state
 --------------------------------------------------------------------------------
@@ -130,12 +129,44 @@ end
 --------------------------------------------------------------------------------
 -- JSON-RPC helpers
 --------------------------------------------------------------------------------
+local pendingSends = {}  -- array of {sock, data}
+
+local function sendAll(sock, data)
+	-- Queue data for non-blocking send.
+	-- widget:Update() will drain the queue each frame.
+	pendingSends[#pendingSends + 1] = {sock = sock, data = data}
+end
+
+local function drainPendingSends()
+	for i = #pendingSends, 1, -1 do
+		local ps = pendingSends[i]
+		local sent, err = ps.sock:send(ps.data)
+		if sent then
+			if sent < #ps.data then
+				-- Partial send: keep the remaining data for the next frame
+				ps.data = ps.data:sub(sent + 1)
+			else
+				-- Full send succeeded
+				table.remove(pendingSends, i)
+			end
+		elseif err == "wantwrite" or err == "wantread" then
+			-- Socket busy — LuaSocket buffers internally,
+			-- next send() with same data will continue.
+			-- Leave in queue for next frame.
+		else
+			-- Real error (closed, reset, etc.)
+			table.remove(pendingSends, i)
+			spEcho("[BARMCP] send error: " .. tostring(err))
+		end
+	end
+end
+
 local function sendRaw(client, tbl)
 	local ok, line = pcall(Json.encode, tbl)
 	if not ok then
 		line = '{"jsonrpc":"2.0","error":{"code":-32603,"message":"encode error"}}'
 	end
-	client.sock:send(line .. "\n")
+	sendAll(client.sock, line .. "\n")
 end
 
 local function sendResult(client, id, result)
@@ -259,20 +290,10 @@ local function tool_game_info(args)
 	return ok and enc or "{}"
 end
 
-local function tool_ping(args)
-	return "pong"
-end
-
 --------------------------------------------------------------------------------
 -- Tool registry
 --------------------------------------------------------------------------------
 local TOOLS = {
-	{
-		name        = "ping",
-		description = "Heartbeat check to verify connection is alive.",
-		inputSchema = {type="object", properties={}},
-		handler     = tool_ping,
-	},
 	{
 		name        = "lua_eval",
 		description = "Execute Lua code in the unsynced LuaUI widget environment. Returns the serialized return value(s).",
@@ -392,6 +413,12 @@ local function onToolsCall(client, msg)
 		return
 	end
 
+	-- Debug: log tool call with params
+	if debugMode then
+		local argsStr = pcall(Json.encode, args)
+		spEcho("[BARMCP] >>> tool '" .. toolName .. "' args=" .. tostring(argsStr))
+	end
+
 	-- Async tools: forwarded to the synced gadget companion via LuaRulesMsg
 	if tool.async then
 		local reqId = newReqId()
@@ -403,6 +430,9 @@ local function onToolsCall(client, msg)
 		elseif toolName == "gadget_disable"  then fwd = "mcp_gadget_disable:" .. reqId .. ":" .. tostring(args.name or "")
 		elseif toolName == "gadget_reload"   then fwd = "mcp_gadget_reload:"  .. reqId .. ":" .. tostring(args.name or "")
 		end
+		if debugMode then
+			spEcho("[BARMCP] >>> async forward: " .. fwd)
+		end
 		Spring.SendLuaRulesMsg(fwd)
 		return
 	end
@@ -410,8 +440,14 @@ local function onToolsCall(client, msg)
 	-- Sync tools: call handler directly
 	local ok, result = pcall(tool.handler, args)
 	if not ok then
+		if debugMode then
+			spEcho("[BARMCP] <<< tool '" .. toolName .. "' ERROR: " .. tostring(result))
+		end
 		sendResult(client, msg.id, mcpErr(tostring(result)))
 		return
+	end
+	if debugMode then
+		spEcho("[BARMCP] <<< tool '" .. toolName .. "' result=" .. tostring(result))
 	end
 	sendResult(client, msg.id, mcpOk(result))
 end
@@ -470,6 +506,9 @@ end
 function widget:Update(dt)
 	if not server then return end
 
+	-- Drain any pending sends from the previous frame
+	drainPendingSends()
+
 	local readable, _, err = socket.select(selectSet, nil, 0)
 	if err and err ~= "timeout" then
 		spEcho("[BARMCP] select error: " .. tostring(err))
@@ -495,13 +534,6 @@ function widget:Update(dt)
 				for _, c in ipairs(clients) do
 					if c.sock == sock then
 						c.buffer = c.buffer .. chunk
-						-- Prevent buffer bloat: drop connection if no newline found within limit
-						if #c.buffer > MCP_MAX_BUFFER then
-							spEcho("[BARMCP] Buffer overflow from client - dropping connection")
-							sock:close()
-							removeClient(sock)
-							return
-						end
 						while true do
 							local nl = c.buffer:find("\n", 1, true)
 							if not nl then break end

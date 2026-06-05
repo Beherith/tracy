@@ -54,9 +54,9 @@ logger.setLevel(getattr(logging, _LOG_LEVEL, logging.INFO))
 
 formatter = logging.Formatter("[%(asctime)s] [BRIDGE] %(levelname)-5s %(message)s", datefmt="%H:%M:%S")
 
-_stderr_handler = logging.StreamHandler(sys.stderr)
-_stderr_handler.setFormatter(formatter)
-logger.addHandler(_stderr_handler)
+_stdout_handler = logging.StreamHandler(sys.stdout)
+_stdout_handler.setFormatter(formatter)
+logger.addHandler(_stdout_handler)
 
 _file_handler = logging.FileHandler(os.path.join(_HERE, "bar_tracy_bridge.log"), encoding="utf-8")
 _file_handler.setFormatter(formatter)
@@ -187,80 +187,93 @@ class BarTcpClient:
         self._reader_thread = None
 
     @staticmethod
-    def _parse_jsonrpc_line(line: str) -> Optional[Dict[str, Any]]:
-        """Parse a single newline-delimited JSON-RPC line. Returns None on error."""
-        try:
-            msg = json.loads(line)
-        except json.JSONDecodeError:
-            logger.error("Invalid JSON from BAR MCP: %s", line[:200])
+    def _parse_jsonrpc_obj(obj: Any) -> Optional[Dict[str, Any]]:
+        """Validate that a decoded JSON value is a valid JSON-RPC message dict."""
+        if not isinstance(obj, dict):
             return None
-        if not isinstance(msg, dict):
-            return None
-        return msg
+        return obj
+
+    def _deliver_response(self, msg: Dict[str, Any]) -> None:
+        """Demultiplex a parsed JSON-RPC response by request ID."""
+        resp_id = msg.get("id")
+        if resp_id is not None:
+            ev = self._pending.pop(int(resp_id), None)
+            if ev:
+                self._pending_results[int(resp_id)] = msg
+                ev.set()
+                logger.debug("BAR TCP <- response id=%s delivered", resp_id)
+            else:
+                logger.warning(
+                    "BAR TCP <- unsolicited response id=%s (no pending request)",
+                    resp_id,
+                )
+        else:
+            logger.debug("BAR TCP <- notification: %s", json.dumps(msg)[:100])
 
     def _reader_loop(self) -> None:
-        """Background thread: read from socket, parse JSON-RPC lines, demultiplex by id.
+        """Background thread: read from socket, parse JSON-RPC objects, demultiplex by id.
 
-        Invariant: complete lines are always parsed from _buffer *before* calling
-        recv().  If a previous recv() returned two responses in one chunk, the
-        second sits in _buffer and is consumed immediately on the next loop
-        iteration — we never block on the network when data is already available.
+        Uses json.JSONDecoder.raw_decode() for JSON-aware parsing instead of
+        naive newline splitting.  This correctly handles responses whose string
+        values contain literal newline characters (e.g. vfs_read returning
+        multi-line source files).
         """
         logger.debug("BAR TCP reader thread started")
+        decoder = json.JSONDecoder()
+        MAX_BUFFER = 4 * 1024 * 1024  # 4 MB safety cap
+
         while self._reader_running:
             try:
-                # --- Phase 1: parse any complete lines already in the buffer ---
-                parsed_line = False
-                while self._reader_running:
-                    nl_pos = self._buffer.find("\n")
-                    if nl_pos < 0:
+                # --- Try to decode complete JSON objects from the buffer ---
+                while self._reader_running and self._buffer:
+                    # Skip leading whitespace
+                    stripped_pos = 0
+                    while stripped_pos < len(self._buffer) and self._buffer[stripped_pos] in ' \t\n\r':
+                        stripped_pos += 1
+
+                    if stripped_pos > 0:
+                        self._buffer = self._buffer[stripped_pos:]
+
+                    if not self._buffer:
                         break
-                    line = self._buffer[:nl_pos]
-                    self._buffer = self._buffer[nl_pos + 1:]
-                    parsed_line = True
 
-                    if not line.strip():
-                        continue
-
-                    msg = self._parse_jsonrpc_line(line)
-                    if msg is None:
-                        continue
-
-                    resp_id = msg.get("id")
-                    if resp_id is not None:
-                        ev = self._pending.pop(int(resp_id), None)
-                        if ev:
-                            self._pending_results[int(resp_id)] = msg
-                            ev.set()
-                            logger.debug("BAR TCP <- response id=%s delivered", resp_id)
-                        else:
-                            logger.warning(
-                                "BAR TCP <- unsolicited response id=%s (no pending request)",
-                                resp_id,
-                            )
-                    else:
-                        logger.debug("BAR TCP <- notification or stray: %s", line[:100])
-
-                # --- Phase 2: recv only when no complete line was available ---
-                if self._sock and not parsed_line:
                     try:
-                        chunk = self._sock.recv(4096)
+                        obj, end_pos = decoder.raw_decode(self._buffer)
+                        # Successfully parsed a JSON object — consume it
+                        self._buffer = self._buffer[end_pos:]
+
+                        msg = self._parse_jsonrpc_obj(obj)
+                        if msg is not None:
+                            self._deliver_response(msg)
+                        else:
+                            logger.debug("BAR TCP <- non-dict JSON: %s", str(obj)[:100])
+                    except json.JSONDecodeError:
+                        # Incomplete JSON — need more data from the socket
+                        break
+
+                # --- Safety: discard buffer if it grew too large (malformed data) ---
+                if len(self._buffer) > MAX_BUFFER:
+                    logger.warning(
+                        "BAR TCP buffer exceeded %d bytes — discarding (likely malformed data)",
+                        MAX_BUFFER,
+                    )
+                    self._buffer = ""
+
+                # --- Recv more data from the socket ---
+                if self._sock:
+                    try:
+                        chunk = self._sock.recv(65536)
                     except socket.timeout:
+                        pass  # normal — nothing to read right now
                         continue
                     except OSError:
                         break
 
                     if not chunk:
+                        # Connection closed by peer
                         break
 
                     self._buffer += chunk.decode("utf-8", errors="replace")
-                    # Loop back to Phase 1 to parse the newly appended data
-
-                # --- Phase 3: detect closed socket (only when idle) ---
-                if self._sock and self._buffer == "" and not parsed_line:
-                    # Socket exists but we got nothing and buffer is empty —
-                    # check if it was closed by attempting a zero-byte recv.
-                    pass  # timeout in Phase 2 will handle this on next iteration
 
                 if not self._sock:
                     break
@@ -389,6 +402,7 @@ class BarTcpClient:
             request_id = msg["id"]
 
         payload = json.dumps(msg) + "\n"
+        logger.debug("[BRIDGE:TCP_WIRE] -> method='%s' params type=%s value=%s", method, type(params).__name__, params)
         logger.debug("BAR TCP -> %s", payload.rstrip())
 
         try:
@@ -447,15 +461,20 @@ class BarTcpClient:
         logger.debug("BAR TCP <- response id=%s", response.get("id"))
         return response
 
-    def call_tool(self, tool_name: str, arguments: Optional[Dict[str, Any]] = None, timeout: float = 30.0) -> Dict[str, Any]:
+    def call_tool(self, tool_name: str, arguments: Optional[Dict[str, Any]] = None, timeout: float = 120.0) -> Dict[str, Any]:
         """Call a BAR MCP tool via `tools/call` and return the result.
 
         Returns the raw result dict from BAR (contains 'content' and 'isError').
         Raises BarConnectionError if the tool returned isError=true.
+
+        Default timeout is 120s because the Lua server processes requests in
+        widget:Update() which runs at game framerate — if the game is slow or
+        paused, large responses (e.g. vfs_read of big files) can take a while.
         """
         params: Dict[str, Any] = {"name": tool_name}
         if arguments:
             params["arguments"] = arguments
+        logger.debug("[BRIDGE:TCP_CLIENT] call_tool tool='%s' params=%s", tool_name, params)
 
         response = self.call_method("tools/call", params, timeout)
 
@@ -541,17 +560,21 @@ class BarToolRegistry:
         )
         return self._tools
 
-    def call_tool(self, name: str, arguments: Optional[Dict[str, Any]] = None, timeout: float = 30.0) -> str:
+    def call_tool(self, name: str, arguments: Optional[Dict[str, Any]] = None, timeout: float = 120.0) -> str:
         """Call a BAR tool by name and return the plain text result.
 
         Args:
             name: Tool name (e.g., "game_info", "widget_reload")
             arguments: Dict of arguments matching the tool's inputSchema
-            timeout: Max seconds to wait for response
+            timeout: Max seconds to wait for response (default 120s because
+                     the Lua server processes requests in widget:Update() at
+                     game framerate — if paused or slow, responses can take
+                     a long time)
 
         Returns:
             Plain text result string from the tool.
         """
+        logger.debug("[BRIDGE:REGISTRY] call_tool name='%s' arguments type=%s value=%s", name, type(arguments).__name__, arguments)
         if name not in self._tool_map:
             available = ", ".join(self._tool_map.keys())
             raise BarConnectionError(
@@ -830,10 +853,10 @@ class TracyHttpClient:
                         # First endpoint event — store URL and signal connect()
                         if not self._message_url:
                             self._message_url = data.strip()
-                            logger.debug("Tracy SSE ► endpoint event: %s", self._message_url)
+                            logger.debug("Tracy SSE -> endpoint event: %s", self._message_url)
                             self._endpoint_event.set()
                         else:
-                            logger.debug("Tracy SSE ► duplicate endpoint: %s", data)
+                            logger.debug("Tracy SSE -> duplicate endpoint: %s", data)
                     elif event_type in ("message", "result"):
                         # FastMCP (MCP Python SDK) sends JSON-RPC responses as
                         # 'event: message'.  Handle both 'message' and 'result'
@@ -1670,7 +1693,27 @@ def _create_bar_tools_server(
     """
     import mcp.server.fastmcp as fastmcp
 
-    server = fastmcp.FastMCP("BAR+Tracy Bridge")
+    server = fastmcp.FastMCP(name = "Beyond All Reason + Tracy profiling MCP server",
+    instructions = """
+    This server exposes tools for the game Beyond All Reason (BAR) on the Recoil Engine (SpringRTS) for developing and profiling BAR LuaUI widgets and LuaRules gadgets, with deep integration to Tracy for performance insights.
+    Tracy profiling should be done by adding zones in the Lua code with names that start with the widget/gadget name, e.g. tracy.ZoneBeginN("MyWidget:Update") / tracy.ZoneEnd()
+    Ensure all return paths are covered with tracy.ZoneEnd(). 
+    Example:
+    '''lua 
+function foo(bar)
+    tracy.ZoneBeginN("MyWidget:foo")
+    -- widget update logic here
+    if bar > 0 then
+        tracy.ZoneEnd()
+        return true
+    end
+    tracy.ZoneEnd()
+end
+    '''
+
+    """
+
+    )
 
     # MCP handshake: initialize is a request (with id), then send initialized notification.
     # The Lua server replies using msg.id, so we must send a proper request and validate the response id.
@@ -1780,21 +1823,33 @@ def _create_bar_tools_server(
         # Build source for a real function with typed signature
         param_str = ", ".join(param_signatures) if param_signatures else ""
         # Extract just param names to build the _args dict literal
+        # Keys must be quoted string literals, values are the parameter variables
         param_names = [p[0] for p in params]
-        kwargs_expr = "{" + ", ".join(param_names) + "}" if param_names else "{}"
+        kwargs_expr = "{" + ", ".join(f'"{p}": {p}' for p in param_names) + "}" if param_names else "{}"
 
         func_source = f'''
 def {tool_name}({param_str}) -> str:
     """{tool_desc}"""
     _args = {kwargs_expr}
+    logger.debug("[BRIDGE:FUNC] '{tool_name}' _args type={{_args.__class__.__name__}} value={{_args}}")
     try:
-        return bar_registry.call_tool({tool_name!r}, _args)
+        logger.info("Calling BAR tool '{tool_name}' with args: %s", _args)
+        result = bar_registry.call_tool({tool_name!r}, _args, timeout=120.0)
+        logger.info("BAR tool '{tool_name}' result: %s", result)
+        return result
     except BarConnectionError as exc:
+        # Only reconnect on actual transport errors (connection reset, etc.),
+        # NOT on timeouts — timeouts mean the game is slow (widget:Update runs
+        # at game framerate), and reconnecting kills the TCP connection the
+        # Lua side is still using.
+        if "Timeout" in str(exc):
+            logger.warning("BAR tool '%s' timed out (game may be paused or slow): %s", {tool_name!r}, exc)
+            raise
         logger.warning("BAR tool '%s' failed, attempting reconnect: %s", {tool_name!r}, exc)
         try:
             bar_client.reconnect()
             bar_registry.discover()
-            return bar_registry.call_tool({tool_name!r}, _args)
+            return bar_registry.call_tool({tool_name!r}, _args, timeout=120.0)
         except BarConnectionError as exc2:
             raise BarConnectionError(
                 f"BAR tool '{tool_name}' failed after reconnect: {{exc2}}"
