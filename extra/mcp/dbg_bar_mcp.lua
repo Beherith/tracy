@@ -140,7 +140,7 @@ end
 local function drainPendingSends()
 	for i = #pendingSends, 1, -1 do
 		local ps = pendingSends[i]
-		local sent, err = ps.sock:send(ps.data)
+		local sent, err, partial = ps.sock:send(ps.data)
 		if sent then
 			if sent < #ps.data then
 				-- Partial send: keep the remaining data for the next frame
@@ -149,10 +149,13 @@ local function drainPendingSends()
 				-- Full send succeeded
 				table.remove(pendingSends, i)
 			end
-		elseif err == "wantwrite" or err == "wantread" then
-			-- Socket busy — LuaSocket buffers internally,
-			-- next send() with same data will continue.
-			-- Leave in queue for next frame.
+		elseif err == "timeout" or err == "wantwrite" or err == "wantread" then
+			if type(partial) == "number" and partial > 0 then
+				ps.data = ps.data:sub(partial + 1)
+				if ps.data == "" then
+					table.remove(pendingSends, i)
+				end
+			end
 		else
 			-- Real error (closed, reset, etc.)
 			table.remove(pendingSends, i)
@@ -184,6 +187,14 @@ end
 
 local function mcpErr(text)
 	return {content = {{type = "text", text = tostring(text)}}, isError = true}
+end
+
+local function debugPreview(value)
+	local s = tostring(value)
+	if #s > 1024 then
+		return s:sub(1, 1024) .. "\n[BARMCP: debug log truncated, bytes=" .. tostring(#s) .. "]"
+	end
+	return s
 end
 
 --------------------------------------------------------------------------------
@@ -415,8 +426,8 @@ local function onToolsCall(client, msg)
 
 	-- Debug: log tool call with params
 	if debugMode then
-		local argsStr = pcall(Json.encode, args)
-		spEcho("[BARMCP] >>> tool '" .. toolName .. "' args=" .. tostring(argsStr))
+		local okArgs, argsStr = pcall(Json.encode, args)
+		spEcho("[BARMCP] >>> tool '" .. toolName .. "' args=" .. tostring(okArgs and argsStr or args))
 	end
 
 	-- Async tools: forwarded to the synced gadget companion via LuaRulesMsg
@@ -447,7 +458,7 @@ local function onToolsCall(client, msg)
 		return
 	end
 	if debugMode then
-		spEcho("[BARMCP] <<< tool '" .. toolName .. "' result=" .. tostring(result))
+		spEcho("[BARMCP] <<< tool '" .. toolName .. "' result=" .. debugPreview(result))
 	end
 	sendResult(client, msg.id, mcpOk(result))
 end

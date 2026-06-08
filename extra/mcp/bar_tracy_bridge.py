@@ -197,14 +197,16 @@ class BarTcpClient:
         """Demultiplex a parsed JSON-RPC response by request ID."""
         resp_id = msg.get("id")
         if resp_id is not None:
-            ev = self._pending.pop(int(resp_id), None)
+            resp_id_int = int(resp_id)
+            with self._lock:
+                ev = self._pending.pop(resp_id_int, None)
+                self._pending_results[resp_id_int] = msg
             if ev:
-                self._pending_results[int(resp_id)] = msg
                 ev.set()
                 logger.debug("BAR TCP <- response id=%s delivered", resp_id)
             else:
                 logger.warning(
-                    "BAR TCP <- unsolicited response id=%s (no pending request)",
+                    "BAR TCP <- early/unsolicited response id=%s stored",
                     resp_id,
                 )
         else:
@@ -284,13 +286,14 @@ class BarTcpClient:
 
         logger.debug("BAR TCP reader thread stopped")
         # Notify any pending waiters that the connection is gone
-        for ev in self._pending.values():
-            self._pending_results[-1] = BarConnectionError(
-                "BAR MCP connection lost while waiting for response."
-            )
-            ev.set()
-        self._pending.clear()
-        self._pending_results.clear()
+        with self._lock:
+            pending = list(self._pending.items())
+            self._pending.clear()
+            for req_id, ev in pending:
+                self._pending_results[req_id] = BarConnectionError(
+                    "BAR MCP connection lost while waiting for response."
+                )
+                ev.set()
 
     # ------------------------------------------------------------------
     # Response waiting
@@ -313,8 +316,14 @@ class BarTcpClient:
         Blocks until the reader thread delivers the matching response or
         the timeout expires.
         """
-        ev = threading.Event()
         with self._lock:
+            result = self._pending_results.pop(request_id, None)
+            if result is not None:
+                if isinstance(result, BarConnectionError):
+                    raise result
+                return result
+
+            ev = threading.Event()
             self._pending[request_id] = ev
 
         if not ev.wait(timeout=timeout):
@@ -325,7 +334,8 @@ class BarTcpClient:
                 f"Is dbg_bar_mcp.lua loaded? Check game console for '[BARMCP]' messages."
             )
 
-        result = self._pending_results.pop(request_id, None)
+        with self._lock:
+            result = self._pending_results.pop(request_id, None)
         if isinstance(result, BarConnectionError):
             raise result
         if result is None:
@@ -339,13 +349,15 @@ class BarTcpClient:
         self._stop_reader()
         self._cleanup_sock()
         # Clear pending requests so old waiters don't block forever
-        for ev in self._pending.values():
-            self._pending_results[-1] = BarConnectionError(
-                "Reconnecting — previous request cancelled."
-            )
-            ev.set()
-        self._pending.clear()
-        self._pending_results.clear()
+        with self._lock:
+            pending = list(self._pending.items())
+            self._pending.clear()
+            self._pending_results.clear()
+            for req_id, ev in pending:
+                self._pending_results[req_id] = BarConnectionError(
+                    "Reconnecting — previous request cancelled."
+                )
+                ev.set()
 
         addr = f"{self._host}:{self._port}"
         attempt = 1
@@ -584,6 +596,13 @@ class BarToolRegistry:
 
         raw_result = self._client.call_tool(name, arguments, timeout)
         return BarTcpClient._extract_text(raw_result)
+
+
+def _preview_text(value: Any, max_chars: int = 4096) -> str:
+    text = str(value)
+    if len(text) <= max_chars:
+        return text
+    return f"{text[:max_chars]}\n[BRIDGE: log truncated, chars={len(text)}]"
 
 
 # ---------------------------------------------------------------------------
@@ -1835,7 +1854,7 @@ def {tool_name}({param_str}) -> str:
     try:
         logger.info("Calling BAR tool '{tool_name}' with args: %s", _args)
         result = bar_registry.call_tool({tool_name!r}, _args, timeout=120.0)
-        logger.info("BAR tool '{tool_name}' result: %s", result)
+        logger.info("BAR tool '{tool_name}' result: %s", _preview_text(result))
         return result
     except BarConnectionError as exc:
         # Only reconnect on actual transport errors (connection reset, etc.),
@@ -1861,6 +1880,7 @@ def {tool_name}({param_str}) -> str:
                 "bar_client": bar_client,
                 "BarConnectionError": BarConnectionError,
                 "logger": logger,
+                "_preview_text": _preview_text,
             }
             exec(func_source, namespace)
             func = namespace[tool_name]
