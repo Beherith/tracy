@@ -11,6 +11,9 @@
 #   BAR_MCP_PORT      — BAR MCP port         (default: 23452)
 #   TRACY_MCP_HOST    — Tracy MCP hostname   (default: 127.0.0.1)
 #   TRACY_MCP_PORT    — Tracy MCP port       (default: 47380)
+#   TRACY_ENGINE_HOST — Tracy engine host    (default: 127.0.0.1)
+#   TRACY_ENGINE_PORT — Tracy engine port    (default: 8086)
+#   TRACY_ENGINE_ALIAS — Tracy instance alias (default: live_engine)
 #   BRIDGE_LOG_LEVEL  — Log level            (default: INFO)
 #
 # This script:
@@ -33,12 +36,16 @@ export BAR_MCP_HOST="${BAR_MCP_HOST:-127.0.0.1}"
 export BAR_MCP_PORT="${BAR_MCP_PORT:-23452}"
 export TRACY_MCP_HOST="${TRACY_MCP_HOST:-127.0.0.1}"
 export TRACY_MCP_PORT="${TRACY_MCP_PORT:-47380}"
+export TRACY_ENGINE_HOST="${TRACY_ENGINE_HOST:-127.0.0.1}"
+export TRACY_ENGINE_PORT="${TRACY_ENGINE_PORT:-8086}"
+export TRACY_ENGINE_ALIAS="${TRACY_ENGINE_ALIAS:-live_engine}"
 export BRIDGE_LOG_LEVEL="${BRIDGE_LOG_LEVEL:-INFO}"
 
 # Machine-local overrides (not committed). Create start_bridge.local.sh next to
 # this file to set BAR_MCP_PORT, TRACY_MCP_PORT, BRIDGE_LOG_LEVEL, etc:
 #   export BAR_MCP_PORT=23452
 #   export TRACY_MCP_PORT=47380
+#   export TRACY_ENGINE_PORT=8086
 #   export BRIDGE_LOG_LEVEL=DEBUG
 if [ -f "$SCRIPT_DIR/start_bridge.local.sh" ]; then
     . "$SCRIPT_DIR/start_bridge.local.sh"
@@ -69,6 +76,7 @@ done
 echo "[BRIDGE] Starting BAR + Tracy Bridge"
 echo "[BRIDGE] BAR target:   $BAR_MCP_HOST:$BAR_MCP_PORT"
 echo "[BRIDGE] Tracy target: $TRACY_MCP_HOST:$TRACY_MCP_PORT"
+echo "[BRIDGE] Engine Tracy: $TRACY_ENGINE_HOST:$TRACY_ENGINE_PORT as $TRACY_ENGINE_ALIAS"
 echo "[BRIDGE] Transport:    $TRANSPORT"
 echo "[BRIDGE] Auto-start Tracy MCP: handled inside bridge"
 echo "[BRIDGE] Command: $PYTHON $BRIDGE_SCRIPT ${BRIDGE_ARGS[*]:-}"

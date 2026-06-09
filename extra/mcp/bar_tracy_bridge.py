@@ -32,16 +32,18 @@ Environment variables:
 from __future__ import annotations
 
 import argparse
+import inspect
 import json
 import logging
 import os
+import random
 import re
 import socket
 import subprocess
 import sys
 import threading
 import time
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Set
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 
@@ -70,6 +72,9 @@ BAR_PORT = int(os.environ.get("BAR_MCP_PORT", "23452"))
 
 TRACY_HOST = os.environ.get("TRACY_MCP_HOST", "127.0.0.1")
 TRACY_PORT = int(os.environ.get("TRACY_MCP_PORT", "47380"))
+TRACY_ENGINE_HOST = os.environ.get("TRACY_ENGINE_HOST", "127.0.0.1")
+TRACY_ENGINE_PORT = int(os.environ.get("TRACY_ENGINE_PORT", "8086"))
+TRACY_ENGINE_ALIAS = os.environ.get("TRACY_ENGINE_ALIAS", "live_engine")
 _TRACY_MCP_SCRIPT = os.path.join(_HERE, "tracy_mcp.py")
 _TRACY_MCP_PID_FILE = os.path.join(_HERE, "tracy_mcp.pid")
 
@@ -108,6 +113,7 @@ class BarTcpClient:
         self._sock: Optional[socket.socket] = None
         self._buffer = ""
         self._lock = threading.Lock()
+        self._send_lock = threading.Lock()
         self._request_id = 0
 
         # Response demultiplexing: request_id -> (Event, result_or_error)
@@ -303,6 +309,7 @@ class BarTcpClient:
                 break
 
         logger.debug("BAR TCP reader thread stopped")
+        self._cleanup_sock()
         # Notify any pending waiters that the connection is gone
         with self._lock:
             pending = list(self._pending.items())
@@ -419,30 +426,31 @@ class BarTcpClient:
                 "Is the game running with dev mode enabled?"
             )
 
-        msg: Dict[str, Any] = {
-            "jsonrpc": "2.0",
-            "method": method,
-        }
-        if params is not None:
-            msg["params"] = params
-        if request_id is not None:
-            msg["id"] = request_id
-        else:
-            msg["id"] = self._next_id()
-            request_id = msg["id"]
+        with self._send_lock:
+            msg: Dict[str, Any] = {
+                "jsonrpc": "2.0",
+                "method": method,
+            }
+            if params is not None:
+                msg["params"] = params
+            if request_id is not None:
+                msg["id"] = request_id
+            else:
+                msg["id"] = self._next_id()
+                request_id = msg["id"]
 
-        payload = json.dumps(msg) + "\n"
-        logger.debug("[BRIDGE:TCP_WIRE] -> method='%s' params type=%s value=%s", method, type(params).__name__, params)
-        logger.debug("BAR TCP -> %s", payload.rstrip())
+            payload = json.dumps(msg) + "\n"
+            logger.debug("[BRIDGE:TCP_WIRE] -> method='%s' params type=%s value=%s", method, type(params).__name__, params)
+            logger.debug("BAR TCP -> %s", payload.rstrip())
 
-        try:
-            if self._sock:
-                self._sock.sendall(payload.encode("utf-8"))
-        except OSError as exc:
-            self._cleanup_sock()
-            raise BarConnectionError(
-                f"Lost connection to BAR MCP while sending — {exc}"
-            ) from exc
+            try:
+                if self._sock:
+                    self._sock.sendall(payload.encode("utf-8"))
+            except OSError as exc:
+                self._cleanup_sock()
+                raise BarConnectionError(
+                    f"Lost connection to BAR MCP while sending — {exc}"
+                ) from exc
 
         return request_id
 
@@ -461,7 +469,7 @@ class BarTcpClient:
         payload = json.dumps(msg) + "\n"
         logger.debug("BAR TCP -> (notification) %s", payload.rstrip())
 
-        with self._lock:
+        with self._send_lock:
             try:
                 if self._sock:
                     self._sock.sendall(payload.encode("utf-8"))
@@ -723,6 +731,8 @@ class TracyHttpClient:
 
         # Import httpx once and cache it
         self._httpx = httpx
+        self._endpoint_event.clear()
+        self._message_url = None
 
         # Open persistent SSE stream (httpx.stream returns a context manager)
         try:
@@ -923,14 +933,16 @@ class TracyHttpClient:
         except Exception as exc:
             logger.warning("Tracy SSE reader thread error: %s", exc)
         finally:
-            # Notify any pending waiters that the connection is gone
-            for ev in self._pending.values():
-                self._pending_results[-1] = TracyConnectionError(
-                    "Tracy MCP SSE connection lost while waiting for response."
-                )
-                ev.set()
-            self._pending.clear()
-            self._pending_results.clear()
+            self._connected = False
+            # Notify any pending waiters that the connection is gone.
+            with self._lock:
+                pending = list(self._pending.items())
+                self._pending.clear()
+                for req_id, ev in pending:
+                    self._pending_results[req_id] = TracyConnectionError(
+                        "Tracy MCP SSE connection lost while waiting for response."
+                    )
+                    ev.set()
             logger.debug("Tracy SSE reader thread stopped")
 
     def _handle_sse_response(self, data: str) -> None:
@@ -956,8 +968,9 @@ class TracyHttpClient:
                     ev.set()
                     logger.debug("Tracy SSE <- response id=%s delivered", resp_id)
                 else:
-                    logger.warning(
-                        "Tracy SSE <- unsolicited response id=%s (no pending request)",
+                    self._pending_results[int(resp_id)] = msg
+                    logger.debug(
+                        "Tracy SSE <- early/unsolicited response id=%s stored",
                         resp_id,
                     )
         else:
@@ -982,9 +995,17 @@ class TracyHttpClient:
 
     def _wait_for_response(self, request_id: int, timeout: float) -> Dict[str, Any]:
         """Wait for the SSE response matching a specific request ID."""
-        ev = threading.Event()
         with self._lock:
-            self._pending[request_id] = ev
+            result = self._pending_results.pop(request_id, None)
+            if result is not None:
+                if isinstance(result, TracyConnectionError):
+                    raise result
+                return result
+
+            ev = self._pending.get(request_id)
+            if ev is None:
+                ev = threading.Event()
+                self._pending[request_id] = ev
 
         if not ev.wait(timeout=timeout):
             with self._lock:
@@ -993,7 +1014,8 @@ class TracyHttpClient:
                 f"Timeout waiting for Tracy MCP response id={request_id} after {timeout}s."
             )
 
-        result = self._pending_results.pop(request_id, None)
+        with self._lock:
+            result = self._pending_results.pop(request_id, None)
         if isinstance(result, TracyConnectionError):
             raise result
         if result is None:
@@ -1022,7 +1044,9 @@ class TracyHttpClient:
                 "Is Tracy MCP running?"
             )
 
-        req_id = self._next_id()
+        with self._lock:
+            req_id = self._next_id()
+            self._pending[req_id] = threading.Event()
         msg: Dict[str, Any] = {
             "jsonrpc": "2.0",
             "method": method,
@@ -1238,13 +1262,14 @@ class TracyAutoStart:
 
         while time.monotonic() < deadline:
             try:
-                response = httpx.get(
+                with httpx.stream(
+                    "GET",
                     url,
                     timeout=2.0,
                     headers={"Accept": "text/event-stream"},
-                )
-                if response.status_code == 200:
-                    return True
+                ) as response:
+                    if response.status_code == 200:
+                        return True
             except Exception:
                 pass
             time.sleep(0.5)
@@ -1285,8 +1310,8 @@ class TracyAutoStart:
             python = sys.executable or "python3"
             self._process = subprocess.Popen(
                 [python, self._script_path],
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
                 cwd=os.path.dirname(self._script_path),
             )
             self._started_by_us = True
@@ -1459,7 +1484,23 @@ class ProfileCollector:
             {"code": code, "instance_id": self._instance_id},
             timeout=timeout,
         )
+        if isinstance(result, dict):
+            if result.get("isError"):
+                raise TracyConnectionError(
+                    f"Tracy eval returned an error: {self._extract_mcp_text(result)}"
+                )
+            return self._extract_mcp_text(result)
         return str(result) if result is not None else ""
+
+    @staticmethod
+    def _extract_mcp_text(result: Dict[str, Any]) -> str:
+        contents = result.get("content", [])
+        texts = [
+            item.get("text", "")
+            for item in contents
+            if isinstance(item, dict) and item.get("type") == "text"
+        ]
+        return "\n".join(texts) if texts else str(result)
 
     def _get_zone_stats_snapshot(self) -> Dict[str, Any]:
         """Capture a snapshot of all zone stats keyed by source-location ID.
@@ -1844,216 +1885,716 @@ end
     return server
 
 
-def register_bar_tools(server: Any, bar_client: BarTcpClient, bar_registry: BarToolRegistry):
-    """Discover and register BAR tools on the MCP server."""
-    init_params = {
-        "protocolVersion": "2025-11-25",
-        "capabilities": {},
-        "clientInfo": {"name": "bar_tracy_bridge", "version": "1.0.0"},
-    }
-    try:
-        init_req_id = bar_client.send_jsonrpc("initialize", init_params)
-        init_response = bar_client.receive_response(init_req_id, timeout=5.0)
-        if init_response.get("id") != init_req_id:
-            logger.warning("BAR MCP initialize response id mismatch")
-        if "error" in init_response:
-            logger.warning("BAR MCP initialize error: %s", init_response["error"].get("message", "unknown"))
-        else:
-            logger.info("BAR MCP initialized successfully")
-    except BarConnectionError as exc:
-        logger.warning("No response to initialize request (non-fatal): %s", exc)
+def _schema_type_to_python_type(schema_type: str) -> Any:
+    if schema_type == "string":
+        return str
+    if schema_type == "integer":
+        return int
+    if schema_type == "number":
+        return float
+    if schema_type == "boolean":
+        return bool
+    if schema_type == "array":
+        return list
+    if schema_type == "object":
+        return dict
+    return Any
 
-    bar_client.send_notification("notifications/initialized")
 
-    try:
-        bar_registry.discover()
-    except BarConnectionError as exc:
-        logger.error("Failed to discover BAR tools: %s", exc)
-        return
+def _signature_from_input_schema(input_schema: Dict[str, Any]) -> inspect.Signature:
+    properties = input_schema.get("properties", {})
+    if not isinstance(properties, dict):
+        properties = {}
+    required = set(input_schema.get("required", []))
 
-    def _schema_type_to_python(t: str) -> str:
-        if t == "string": return "str"
-        if t == "integer": return "int"
-        if t == "number": return "float"
-        if t == "boolean": return "bool"
-        return "Any"
-
-    def _schema_default(prop: Dict[str, Any], py_type: str) -> str:
-        if "default" in prop:
-            val = prop["default"]
-            if isinstance(val, bool): return str(val)
-            return "None" if val is None else json.dumps(val)
-        if py_type == "str": return '""'
-        if py_type == "int": return "0"
-        if py_type == "float": return "0.0"
-        if py_type == "bool": return "False"
-        return "None"
-
-    for tool_def in bar_registry.tools:
-        tool_name = tool_def["name"]
-        tool_desc = tool_def.get("description", "")
-        input_schema = tool_def.get("inputSchema", {})
-        properties = input_schema.get("properties", {})
-        if not isinstance(properties, dict): properties = {}
-        required = set(input_schema.get("required", []))
-
-        params: List[str] = []
-        annotations: Dict[str, str] = {}
-        for pname, prop in properties.items():
-            raw_type = prop.get("type", "string")
-            py_type = _schema_type_to_python(raw_type)
-            annotations[pname] = py_type
-            default = _schema_default(prop, py_type)
-            if pname in required:
-                params.append(( pname, f"{pname}: {py_type}", True))
-            else:
-                params.append(( pname, f"{pname}: {py_type} = {default}", False))
-        params.sort(key=lambda x: (not x[2], x[0]))
-        param_signatures = [p[1] for p in params]
-
-        param_str = ", ".join(param_signatures) if param_signatures else ""
-        param_names = [p[0] for p in params]
-        kwargs_expr = "{" + ", ".join(f'"{p}": {p}' for p in param_names) + "}" if param_names else "{}"
-
-        func_source = f'''
-def {tool_name}({param_str}) -> str:
-    """{tool_desc}"""
-    _args = {kwargs_expr}
-    try:
-        result = bar_registry.call_tool({tool_name!r}, _args, timeout=120.0)
-        return result
-    except BarConnectionError as exc:
-        if "Timeout" in str(exc): raise
-        try:
-            bar_client.reconnect()
-            bar_registry.discover()
-            return bar_registry.call_tool({tool_name!r}, _args, timeout=120.0)
-        except BarConnectionError as exc2:
-            raise BarConnectionError(f"BAR tool '{tool_name}' failed after reconnect: {{exc2}}") from exc2
-'''
-        try:
-            namespace = {"bar_registry": bar_registry, "bar_client": bar_client, "BarConnectionError": BarConnectionError, "logger": logger, "_preview_text": _preview_text}
-            exec(func_source, namespace)
-            func = namespace[tool_name]
-            func.__name__ = tool_name
-            func.__doc__ = tool_desc
-            func.__annotations__["return"] = str
-            func.__annotations__.update(annotations)
-            server.tool(tool_name, description=tool_desc)(func)
-        except Exception as reg_err:
-            logger.error("Failed to register BAR tool '%s': %s", tool_name, reg_err)
-
-def register_tracy_tools(server: Any, bar_registry: BarToolRegistry, tracy_client: TracyHttpClient, tracy_registry: TracyToolRegistry, tracy_instance_id: Optional[str]):
-    """Discover and register Tracy tools on the MCP server."""
-    if not tracy_client.connected:
-        return
-
-    try:
-        tracy_registry.discover()
-    except TracyConnectionError as exc:
-        logger.warning("Failed to discover Tracy MCP tools: %s", exc)
-        return
-
-    def _schema_type_to_python(t: str) -> str:
-        if t == "string": return "str"
-        if t == "integer": return "int"
-        if t == "number": return "float"
-        if t == "boolean": return "bool"
-        return "Any"
-
-    def _schema_default(prop: Dict[str, Any], py_type: str) -> str:
-        if "default" in prop:
-            val = prop["default"]
-            if isinstance(val, bool): return str(val)
-            return "None" if val is None else json.dumps(val)
-        if py_type == "str": return '""'
-        if py_type == "int": return "0"
-        if py_type == "float": return "0.0"
-        if py_type == "bool": return "False"
-        return "None"
-
-    for tool_def in tracy_registry.tools:
-        tool_name = tool_def["name"]
-        tool_desc = tool_def.get("description", "")
-        input_schema = tool_def.get("inputSchema", {})
-        properties = input_schema.get("properties", {})
-        if not isinstance(properties, dict):
-            properties = {}
-        required = set(input_schema.get("required", []))
-
-        params: List[str] = []
-        annotations: Dict[str, str] = {}
-        for pname, prop in properties.items():
-            raw_type = prop.get("type", "string")
-            py_type = _schema_type_to_python(raw_type)
-            annotations[pname] = py_type
-            default = _schema_default(prop, py_type)
-            if pname in required:
-                params.append(( pname, f"{pname}: {py_type}", True))
-            else:
-                params.append(( pname, f"{pname}: {py_type} = {default}", False))
-        params.sort(key=lambda x: (not x[2], x[0]))
-        param_signatures = [p[1] for p in params]
-
-        param_str = ", ".join(param_signatures) if param_signatures else ""
-        param_names = [p[0] for p in params]
-        kwargs_expr = "{" + ", ".join(f'"{p}": {p}' for p in param_names) + "}" if param_names else "{}"
-
-        func_source = f'''
-def tracy_{tool_name}({param_str}) -> str:
-    """{tool_desc}"""
-    _args = {kwargs_expr}
-    try:
-        result = tracy_registry.call_tool({tool_name!r}, _args, timeout=120.0)
-        return json.dumps(result) if isinstance(result, (dict, list)) else str(result) if result is not None else ""
-    except TracyConnectionError as exc:
-        try:
-            tracy_client.reconnect()
-            tracy_registry.discover()
-            result = tracy_registry.call_tool({tool_name!r}, _args, timeout=120.0)
-            return json.dumps(result) if isinstance(result, (dict, list)) else str(result) if result is not None else ""
-        except TracyConnectionError as exc2:
-            raise TracyConnectionError(f"Tracy tool 'tracy_{tool_name}' failed after reconnect: {{exc2}}") from exc2
-'''
-        try:
-            namespace = {"tracy_registry": tracy_registry, "tracy_client": tracy_client, "TracyConnectionError": TracyConnectionError, "logger": logger, "_preview_text": _preview_text, "json": json}
-            exec(func_source, namespace)
-            func = namespace[f"tracy_{tool_name}"]
-            func.__name__ = f"tracy_{tool_name}"
-            func.__doc__ = tool_desc
-            func.__annotations__["return"] = str
-            func.__annotations__.update(annotations)
-            server.tool(f"tracy_{tool_name}", description=tool_desc)(func)
-        except Exception as reg_err:
-            logger.error("Failed to register Tracy tool '%s': %s\nSource:\n%s", tool_name, reg_err, func_source)
-
-    if tracy_instance_id:
-        profile_collector = ProfileCollector(bar_registry, tracy_client, tracy_instance_id)
-
-        @server.tool(description="Profile a LuaUI widget: reload it, wait for zone data to accumulate, then collect Tracy zone stats.")
-        def profile_widget(name: str, duration: float = 5.0) -> str:
-            return profile_collector.profile_widget(name, duration)
-
-        @server.tool(description="Profile a LuaRules gadget: reload it, wait for zone data to accumulate, then collect Tracy zone stats.")
-        def profile_gadget(name: str, duration: float = 5.0) -> str:
-            return profile_collector.profile_gadget(name, duration)
-
-        @server.tool(description="Run two profiling passes on a widget and return the delta.")
-        def profile_widget_diff(name: str, duration: float = 5.0) -> str:
-            return profile_collector.profile_diff(name, duration, reload_tool="widget_reload")
-
-        @server.tool(description="Run two profiling passes on a gadget and return the delta.")
-        def profile_gadget_diff(name: str, duration: float = 5.0) -> str:
-            return profile_collector.profile_diff(name, duration, reload_tool="gadget_reload")
-
-        logger.info("Profile tools registered: profile_widget, profile_gadget, profile_widget_diff, profile_gadget_diff")
-    else:
-        logger.info(
-            "Tracy instance_id not available — profile tools not registered. "
-            "Ensure Tracy MCP auto-connects successfully."
+    params = []
+    for name, prop in properties.items():
+        if not isinstance(prop, dict):
+            prop = {}
+        annotation = _schema_type_to_python_type(prop.get("type", "string"))
+        default = inspect.Parameter.empty
+        if name not in required:
+            default = prop.get("default", None)
+        params.append(
+            inspect.Parameter(
+                name,
+                inspect.Parameter.POSITIONAL_OR_KEYWORD,
+                default=default,
+                annotation=annotation,
+            )
         )
 
-    return server, tracy_registry
+    params.sort(key=lambda p: p.default is not inspect.Parameter.empty)
+    return inspect.Signature(params, return_annotation=str)
+
+
+def _compact_tool_args(kwargs: Dict[str, Any]) -> Dict[str, Any]:
+    """Drop omitted optional args while preserving explicit falsey values."""
+    return {k: v for k, v in kwargs.items() if v is not None}
+
+
+
+BRIDGE_TOOL_NAMES = {
+    "bridge_status",
+    "bridge_reconnect",
+    "bar_call_tool",
+    "tracy_call_tool",
+    "bar_refresh_tools",
+    "tracy_refresh_tools",
+    "bridge_dynamic_tools",
+    "profile_widget",
+    "profile_gadget",
+    "profile_widget_diff",
+    "profile_gadget_diff",
+}
+
+
+def _parse_tool_arguments(arguments: Any) -> Dict[str, Any]:
+    if arguments is None:
+        return {}
+    if isinstance(arguments, dict):
+        return arguments
+    if isinstance(arguments, str):
+        if not arguments.strip():
+            return {}
+        parsed = json.loads(arguments)
+        if not isinstance(parsed, dict):
+            raise ValueError("Tool arguments JSON must decode to an object.")
+        return parsed
+    raise ValueError("Tool arguments must be an object or a JSON object string.")
+
+
+def _mcp_result_to_text(result: Any) -> str:
+    if isinstance(result, dict):
+        contents = result.get("content", [])
+        texts = [
+            item.get("text", "")
+            for item in contents
+            if isinstance(item, dict) and item.get("type") == "text"
+        ]
+        if texts:
+            return "\n".join(texts)
+    return json.dumps(result) if isinstance(result, (dict, list)) else str(result) if result is not None else ""
+
+
+def _mcp_result_to_data(result: Any) -> Any:
+    if isinstance(result, dict):
+        structured = result.get("structuredContent")
+        if structured is not None:
+            if isinstance(structured, dict) and "result" in structured:
+                return structured["result"]
+            return structured
+        text = _mcp_result_to_text(result)
+        try:
+            return json.loads(text)
+        except (TypeError, json.JSONDecodeError):
+            return result
+    return result
+
+
+class ToolListNotifier:
+    """Central best-effort hook for dynamic tool-list changes."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._generation = 0
+
+    @property
+    def generation(self) -> int:
+        with self._lock:
+            return self._generation
+
+    def notify(self, source: str, tool_names: List[str]) -> None:
+        with self._lock:
+            self._generation += 1
+            generation = self._generation
+        logger.info(
+            "Tool list changed from %s (generation %d): %s",
+            source,
+            generation,
+            ", ".join(tool_names),
+        )
+
+
+def _remove_tool(server: Any, name: str) -> bool:
+    manager = getattr(server, "_tool_manager", None)
+    tools = getattr(manager, "_tools", None)
+    if isinstance(tools, dict) and name in tools:
+        del tools[name]
+        return True
+    return False
+
+
+def _install_or_replace_tool(server: Any, name: str, description: str, func: Callable[..., Any]) -> None:
+    _remove_tool(server, name)
+    server.tool(name=name, description=description)(func)
+
+
+class BarBackendSupervisor:
+    """Keeps the BAR TCP MCP backend reconnectable behind stable bridge tools."""
+
+    def __init__(self, server: Any, notifier: ToolListNotifier, host: str = BAR_HOST, port: int = BAR_PORT) -> None:
+        self._server = server
+        self._notifier = notifier
+        self._host = host
+        self._port = port
+        self._lock = threading.RLock()
+        self._connect_lock = threading.Lock()
+        self._stop_event = threading.Event()
+        self._monitor_thread: Optional[threading.Thread] = None
+        self._installed_tools: Set[str] = set()
+        self._backoff = 1.0
+        self.client = BarTcpClient(host, port)
+        self.registry = BarToolRegistry(self.client)
+        self.state = "offline"
+        self.generation = 0
+        self.last_error: Optional[str] = None
+        self.last_ready_at: Optional[float] = None
+
+    def start(self) -> None:
+        if self._monitor_thread and self._monitor_thread.is_alive():
+            return
+        self._monitor_thread = threading.Thread(target=self._monitor_loop, daemon=True, name="bar-backend-supervisor")
+        self._monitor_thread.start()
+
+    def stop(self) -> None:
+        self._stop_event.set()
+        if self._monitor_thread and self._monitor_thread.is_alive():
+            self._monitor_thread.join(timeout=2.0)
+        self.client.disconnect()
+
+    def status(self) -> Dict[str, Any]:
+        with self._lock:
+            return {
+                "state": self.state,
+                "generation": self.generation,
+                "tools": len(self.registry.tools),
+                "tool_names": self.registry.tool_names,
+                "last_error": self.last_error,
+                "last_ready_at": self.last_ready_at,
+                "target": f"{self._host}:{self._port}",
+            }
+
+    def _set_state(self, state: str, error: Optional[str] = None) -> None:
+        with self._lock:
+            if self.state != state:
+                logger.info("BAR backend state: %s -> %s", self.state, state)
+            self.state = state
+            self.last_error = error
+
+    def mark_offline(self, error: str) -> None:
+        logger.warning("BAR backend marked offline: %s", error)
+        self._set_state("offline", error)
+        with self._lock:
+            self.generation += 1
+        self.client.disconnect()
+
+    def ensure_ready(self, timeout: float = 5.0) -> None:
+        with self._lock:
+            if self.state == "ready" and self.client.connected:
+                return
+        if not self._connect_lock.acquire(timeout=timeout):
+            raise BarConnectionError("Timed out waiting for BAR reconnect lock.")
+        try:
+            with self._lock:
+                if self.state == "ready" and self.client.connected:
+                    return
+            self._set_state("connecting")
+            self.client.disconnect()
+            self.client.connect()
+            self._initialize_client()
+            self.registry.discover()
+            self._install_dynamic_tools()
+            with self._lock:
+                self.state = "ready"
+                self.last_error = None
+                self.generation += 1
+                self.last_ready_at = time.time()
+                self._backoff = 1.0
+            logger.info("BAR backend ready (generation %d)", self.generation)
+        except Exception as exc:
+            self._set_state("offline", str(exc))
+            self.client.disconnect()
+            raise
+        finally:
+            self._connect_lock.release()
+
+    def refresh_tools(self) -> List[str]:
+        self.ensure_ready()
+        before = set(self.registry.tool_names)
+        self.registry.discover()
+        self._install_dynamic_tools()
+        after = set(self.registry.tool_names)
+        if before != after:
+            with self._lock:
+                self.generation += 1
+        return self.registry.tool_names
+
+    def call_tool(self, name: str, arguments: Optional[Dict[str, Any]] = None, timeout: float = 120.0) -> str:
+        last_exc: Optional[Exception] = None
+        for attempt in range(2):
+            self.ensure_ready()
+            if name not in self.registry.tool_names:
+                self.refresh_tools()
+            try:
+                return self.registry.call_tool(name, arguments or {}, timeout=timeout)
+            except BarConnectionError as exc:
+                last_exc = exc
+                self.mark_offline(str(exc))
+                if attempt == 0:
+                    continue
+                break
+        raise BarConnectionError(f"BAR tool '{name}' failed after reconnect: {last_exc}")
+
+    def _initialize_client(self) -> None:
+        init_params = {
+            "protocolVersion": "2025-11-25",
+            "capabilities": {},
+            "clientInfo": {"name": "bar_tracy_bridge", "version": "1.0.0"},
+        }
+        init_req_id = self.client.send_jsonrpc("initialize", init_params)
+        init_response = self.client.receive_response(init_req_id, timeout=5.0)
+        if "error" in init_response:
+            logger.warning("BAR MCP initialize error: %s", init_response["error"].get("message", "unknown"))
+        self.client.send_notification("notifications/initialized")
+
+    def _install_dynamic_tools(self) -> None:
+        discovered_names: Set[str] = set()
+        for tool_def in self.registry.tools:
+            tool_name = tool_def["name"]
+            if tool_name in BRIDGE_TOOL_NAMES:
+                logger.warning("Skipping BAR tool '%s' because it conflicts with a bridge tool", tool_name)
+                continue
+            discovered_names.add(tool_name)
+            tool_desc = tool_def.get("description", "")
+            input_schema = tool_def.get("inputSchema", {})
+            func = self._make_tool_handler(tool_name, tool_desc, input_schema if isinstance(input_schema, dict) else {})
+            _install_or_replace_tool(self._server, tool_name, tool_desc, func)
+        for old_name in self._installed_tools - discovered_names:
+            _remove_tool(self._server, old_name)
+        if discovered_names != self._installed_tools:
+            self._installed_tools = discovered_names
+            self._notifier.notify("bar", sorted(discovered_names))
+
+    def _make_tool_handler(self, tool_name: str, tool_desc: str, input_schema: Dict[str, Any]):
+        def handler(**kwargs) -> str:
+            return self.call_tool(tool_name, _compact_tool_args(kwargs), timeout=120.0)
+
+        handler.__name__ = tool_name
+        handler.__doc__ = tool_desc
+        handler.__signature__ = _signature_from_input_schema(input_schema)
+        handler.__annotations__ = {"return": str}
+        return handler
+
+    def _monitor_loop(self) -> None:
+        while not self._stop_event.is_set():
+            wait = 5.0
+            try:
+                if self.state == "ready":
+                    if not self.client.ping(timeout=2.0):
+                        self.mark_offline("BAR heartbeat failed")
+                else:
+                    self.ensure_ready(timeout=2.0)
+            except Exception as exc:
+                self._set_state("offline", str(exc))
+                wait = min(self._backoff, 30.0) + random.random()
+                self._backoff = min(self._backoff * 2.0, 30.0)
+            else:
+                wait = 5.0 if self.state == "ready" else min(self._backoff, 30.0) + random.random()
+            self._stop_event.wait(wait)
+
+
+class TracyBackendSupervisor:
+    """Keeps Tracy MCP and the live engine Tracy instance reconnectable."""
+
+    def __init__(
+        self,
+        server: Any,
+        notifier: ToolListNotifier,
+        host: str = TRACY_HOST,
+        port: int = TRACY_PORT,
+        engine_address: str = "127.0.0.1",
+        engine_port: int = 8086,
+        engine_alias: str = "live_engine",
+    ) -> None:
+        self._server = server
+        self._notifier = notifier
+        self._host = host
+        self._port = port
+        self._engine_address = engine_address
+        self._engine_port = engine_port
+        self._engine_alias = engine_alias
+        self._auto = TracyAutoStart(host=host, port=port)
+        self._lock = threading.RLock()
+        self._connect_lock = threading.Lock()
+        self._stop_event = threading.Event()
+        self._monitor_thread: Optional[threading.Thread] = None
+        self._installed_tools: Set[str] = set()
+        self._backoff = 1.0
+        self.client: Optional[TracyHttpClient] = None
+        self.registry: Optional[TracyToolRegistry] = None
+        self.mcp_state = "offline"
+        self.engine_state = "offline"
+        self.generation = 0
+        self.engine_generation = 0
+        self.instance_id: Optional[str] = None
+        self.last_error: Optional[str] = None
+        self.last_ready_at: Optional[float] = None
+
+    def start(self) -> None:
+        if self._monitor_thread and self._monitor_thread.is_alive():
+            return
+        self._monitor_thread = threading.Thread(target=self._monitor_loop, daemon=True, name="tracy-backend-supervisor")
+        self._monitor_thread.start()
+
+    def stop(self) -> None:
+        self._stop_event.set()
+        if self._monitor_thread and self._monitor_thread.is_alive():
+            self._monitor_thread.join(timeout=2.0)
+        self._disconnect_client()
+
+    def status(self) -> Dict[str, Any]:
+        with self._lock:
+            return {
+                "mcp_state": self.mcp_state,
+                "engine_state": self.engine_state,
+                "generation": self.generation,
+                "engine_generation": self.engine_generation,
+                "instance_id": self.instance_id,
+                "tools": len(self.registry.tools) if self.registry else 0,
+                "tool_names": self.registry.tool_names if self.registry else [],
+                "last_error": self.last_error,
+                "last_ready_at": self.last_ready_at,
+                "target": f"{self._host}:{self._port}",
+                "engine_target": f"{self._engine_address}:{self._engine_port}",
+            }
+
+    def ensure_mcp_ready(self, timeout: float = 30.0) -> None:
+        with self._lock:
+            if self.mcp_state == "ready" and self.client and self.client.connected and self.registry:
+                return
+        if not self._connect_lock.acquire(timeout=timeout):
+            raise TracyConnectionError("Timed out waiting for Tracy reconnect lock.")
+        try:
+            with self._lock:
+                if self.mcp_state == "ready" and self.client and self.client.connected and self.registry:
+                    return
+                self.mcp_state = "connecting"
+                self.last_error = None
+            self._disconnect_client()
+            if not self._auto.ensure_running(auto_start=True):
+                raise TracyConnectionError("Tracy MCP is not running and could not be auto-started.")
+            client = TracyHttpClient(self._host, self._port)
+            client.connect()
+            registry = TracyToolRegistry(client)
+            registry.discover()
+            with self._lock:
+                self.client = client
+                self.registry = registry
+                self.mcp_state = "ready"
+                self.last_error = None
+                self.generation += 1
+                self.last_ready_at = time.time()
+                self._backoff = 1.0
+            self._install_dynamic_tools()
+            logger.info("Tracy MCP backend ready (generation %d)", self.generation)
+        except Exception as exc:
+            self.mark_mcp_offline(str(exc))
+            raise
+        finally:
+            self._connect_lock.release()
+
+    def ensure_engine_ready(self) -> str:
+        self.ensure_mcp_ready()
+        with self._lock:
+            if self.instance_id and self.engine_state == "ready" and self._instance_exists_locked(self.instance_id):
+                return self.instance_id
+            client = self.client
+        if not client:
+            raise TracyConnectionError("Tracy MCP client is unavailable.")
+        with self._lock:
+            self.engine_state = "connecting"
+        instance_id = self._auto.auto_connect(client, address=self._engine_address, port=self._engine_port, alias=self._engine_alias)
+        if not instance_id:
+            with self._lock:
+                self.engine_state = "offline"
+                self.last_error = "Tracy MCP could not connect to the live engine."
+            raise TracyConnectionError(f"Tracy MCP could not connect to the engine at {self._engine_address}:{self._engine_port}.")
+        with self._lock:
+            self.instance_id = instance_id
+            self.engine_state = "ready"
+            self.engine_generation += 1
+            self.last_error = None
+        return instance_id
+
+    def refresh_tools(self) -> List[str]:
+        self.ensure_mcp_ready()
+        if not self.registry:
+            return []
+        before = set(self.registry.tool_names)
+        self.registry.discover()
+        self._install_dynamic_tools()
+        after = set(self.registry.tool_names)
+        if before != after:
+            with self._lock:
+                self.generation += 1
+        return self.registry.tool_names
+
+    def call_tool(self, name: str, arguments: Optional[Dict[str, Any]] = None, timeout: float = 120.0) -> Any:
+        last_exc: Optional[Exception] = None
+        for attempt in range(2):
+            self.ensure_mcp_ready()
+            if not self.registry:
+                raise TracyConnectionError("Tracy registry is unavailable.")
+            if name not in self.registry.tool_names:
+                self.refresh_tools()
+            try:
+                return self.registry.call_tool(name, arguments or {}, timeout=timeout)
+            except TracyConnectionError as exc:
+                last_exc = exc
+                self.mark_mcp_offline(str(exc))
+                if attempt == 0:
+                    continue
+                break
+        raise TracyConnectionError(f"Tracy tool '{name}' failed after reconnect: {last_exc}")
+
+    def mark_mcp_offline(self, error: str) -> None:
+        logger.warning("Tracy MCP backend marked offline: %s", error)
+        with self._lock:
+            self.mcp_state = "offline"
+            self.engine_state = "offline"
+            self.instance_id = None
+            self.last_error = error
+            self.generation += 1
+        self._disconnect_client()
+
+    def mark_engine_offline(self, error: str) -> None:
+        logger.warning("Tracy engine backend marked offline: %s", error)
+        with self._lock:
+            self.engine_state = "offline"
+            self.instance_id = None
+            self.last_error = error
+            self.engine_generation += 1
+
+    def _disconnect_client(self) -> None:
+        client = self.client
+        self.client = None
+        self.registry = None
+        if client:
+            client.disconnect()
+
+    def _instance_exists_locked(self, instance_id: str) -> bool:
+        client = self.client
+        if not client:
+            return False
+        try:
+            result = client.call_tool("list_instances", {}, timeout=5.0)
+            data = _mcp_result_to_data(result)
+            if isinstance(data, list):
+                return any(isinstance(item, dict) and item.get("id") == instance_id for item in data)
+        except Exception as exc:
+            logger.debug("Could not validate Tracy instance '%s': %s", instance_id, exc)
+            return False
+        return False
+
+    def _install_dynamic_tools(self) -> None:
+        if not self.registry:
+            return
+        discovered_names: Set[str] = set()
+        for tool_def in self.registry.tools:
+            raw_name = tool_def["name"]
+            tool_name = f"tracy_{raw_name}"
+            if tool_name in BRIDGE_TOOL_NAMES:
+                logger.warning("Skipping Tracy tool '%s' because it conflicts with a bridge tool", tool_name)
+                continue
+            discovered_names.add(tool_name)
+            tool_desc = tool_def.get("description", "")
+            input_schema = tool_def.get("inputSchema", {})
+            func = self._make_tool_handler(raw_name, tool_name, tool_desc, input_schema if isinstance(input_schema, dict) else {})
+            _install_or_replace_tool(self._server, tool_name, tool_desc, func)
+        for old_name in self._installed_tools - discovered_names:
+            _remove_tool(self._server, old_name)
+        if discovered_names != self._installed_tools:
+            self._installed_tools = discovered_names
+            self._notifier.notify("tracy", sorted(discovered_names))
+
+    def _make_tool_handler(self, raw_name: str, tool_name: str, tool_desc: str, input_schema: Dict[str, Any]):
+        def handler(**kwargs) -> str:
+            result = self.call_tool(raw_name, _compact_tool_args(kwargs), timeout=120.0)
+            return _mcp_result_to_text(result)
+
+        handler.__name__ = tool_name
+        handler.__doc__ = tool_desc
+        handler.__signature__ = _signature_from_input_schema(input_schema)
+        handler.__annotations__ = {"return": str}
+        return handler
+
+    def _monitor_loop(self) -> None:
+        while not self._stop_event.is_set():
+            wait = 5.0
+            try:
+                if self.mcp_state != "ready":
+                    self.ensure_mcp_ready(timeout=5.0)
+                elif self.client and not self.client.connected:
+                    self.mark_mcp_offline("Tracy SSE stream disconnected")
+                elif self.instance_id and self.engine_state == "ready":
+                    with self._lock:
+                        exists = self._instance_exists_locked(self.instance_id)
+                    if not exists:
+                        self.mark_engine_offline("Tracy live engine instance disappeared")
+            except Exception as exc:
+                with self._lock:
+                    self.last_error = str(exc)
+                    if self.mcp_state != "ready":
+                        self.mcp_state = "offline"
+                wait = min(self._backoff, 30.0) + random.random()
+                self._backoff = min(self._backoff * 2.0, 30.0)
+            else:
+                wait = 5.0 if self.mcp_state == "ready" else min(self._backoff, 30.0) + random.random()
+            self._stop_event.wait(wait)
+
+
+def _bridge_status_payload(bar_backend: BarBackendSupervisor, tracy_backend: TracyBackendSupervisor, notifier: ToolListNotifier) -> Dict[str, Any]:
+    bar = bar_backend.status()
+    tracy = tracy_backend.status()
+    return {
+        "bar": bar,
+        "tracy_mcp": {
+            "state": tracy["mcp_state"],
+            "generation": tracy["generation"],
+            "tools": tracy["tools"],
+            "tool_names": tracy["tool_names"],
+            "last_error": tracy["last_error"],
+            "last_ready_at": tracy["last_ready_at"],
+            "target": tracy["target"],
+        },
+        "tracy_engine": {
+            "state": tracy["engine_state"],
+            "generation": tracy["engine_generation"],
+            "instance_id": tracy["instance_id"],
+            "target": tracy["engine_target"],
+        },
+        "profile_tools_available": bar["state"] == "ready" and tracy["mcp_state"] == "ready" and tracy["engine_state"] == "ready",
+        "tool_notification_generation": notifier.generation,
+        "config": {
+            "bar_target": f"{BAR_HOST}:{BAR_PORT}",
+            "tracy_mcp_target": f"{TRACY_HOST}:{TRACY_PORT}",
+            "tracy_engine_target": f"{TRACY_ENGINE_HOST}:{TRACY_ENGINE_PORT}",
+            "tracy_engine_alias": TRACY_ENGINE_ALIAS,
+        },
+    }
+
+
+def _run_profile_with_retry(
+    bar_backend: BarBackendSupervisor,
+    tracy_backend: TracyBackendSupervisor,
+    notifier: ToolListNotifier,
+    name: str,
+    duration: float,
+    reload_tool: str,
+    diff: bool = False,
+) -> str:
+    last_exc: Optional[Exception] = None
+    for attempt in range(2):
+        try:
+            bar_backend.ensure_ready()
+            instance_id = tracy_backend.ensure_engine_ready()
+            if not tracy_backend.client:
+                raise TracyConnectionError("Tracy client is unavailable after reconnect.")
+            collector = ProfileCollector(bar_backend.registry, tracy_backend.client, instance_id)
+            if diff:
+                return collector.profile_diff(name, duration, reload_tool=reload_tool)
+            if reload_tool == "gadget_reload":
+                return collector.profile_gadget(name, duration)
+            return collector.profile_widget(name, duration)
+        except BarConnectionError as exc:
+            last_exc = exc
+            bar_backend.mark_offline(str(exc))
+        except TracyConnectionError as exc:
+            last_exc = exc
+            tracy_backend.mark_engine_offline(str(exc))
+        if attempt == 0:
+            logger.info("Retrying profile '%s' after backend reconnect", name)
+            continue
+    status = _bridge_status_payload(bar_backend, tracy_backend, notifier)
+    raise RuntimeError(f"Profile failed after reconnect: {last_exc}\n\nBridge status:\n{json.dumps(status, indent=2)}")
+
+
+def register_stable_bridge_tools(server: Any, bar_backend: BarBackendSupervisor, tracy_backend: TracyBackendSupervisor, notifier: ToolListNotifier) -> None:
+    @server.tool(description="Return BAR, Tracy MCP, Tracy engine, and dynamic tool discovery status.")
+    def bridge_status() -> str:
+        return json.dumps(_bridge_status_payload(bar_backend, tracy_backend, notifier), indent=2)
+
+    @server.tool(description="List currently installed dynamic convenience tools discovered from BAR and Tracy.")
+    def bridge_dynamic_tools() -> str:
+        status = _bridge_status_payload(bar_backend, tracy_backend, notifier)
+        dynamic = {
+            "bar": status["bar"]["tool_names"],
+            "tracy": [f"tracy_{name}" for name in status["tracy_mcp"]["tool_names"]],
+            "notification_generation": status["tool_notification_generation"],
+        }
+        return json.dumps(dynamic, indent=2)
+
+    @server.tool(description="Reconnect BAR and/or Tracy backends and refresh discovered tools.")
+    def bridge_reconnect(bar: bool = True, tracy: bool = True, engine: bool = True) -> str:
+        results: Dict[str, Any] = {}
+        if bar:
+            try:
+                bar_backend.mark_offline("manual reconnect requested")
+                bar_backend.ensure_ready()
+                results["bar"] = "ready"
+            except Exception as exc:
+                results["bar"] = f"error: {exc}"
+        if tracy:
+            try:
+                tracy_backend.mark_mcp_offline("manual reconnect requested")
+                tracy_backend.ensure_mcp_ready()
+                results["tracy_mcp"] = "ready"
+            except Exception as exc:
+                results["tracy_mcp"] = f"error: {exc}"
+        if engine:
+            try:
+                results["tracy_engine"] = tracy_backend.ensure_engine_ready()
+            except Exception as exc:
+                results["tracy_engine"] = f"error: {exc}"
+        results["status"] = _bridge_status_payload(bar_backend, tracy_backend, notifier)
+        return json.dumps(results, indent=2)
+
+    @server.tool(description="Call any discovered BAR MCP tool by name. Arguments may be an object or JSON object string.")
+    def bar_call_tool(name: str, arguments: dict = None, timeout: float = 120.0) -> str:
+        return bar_backend.call_tool(name, _parse_tool_arguments(arguments), timeout=timeout)
+
+    @server.tool(description="Call any discovered Tracy MCP tool by name. Arguments may be an object or JSON object string.")
+    def tracy_call_tool(name: str, arguments: dict = None, timeout: float = 120.0) -> str:
+        result = tracy_backend.call_tool(name, _parse_tool_arguments(arguments), timeout=timeout)
+        return _mcp_result_to_text(result)
+
+    @server.tool(description="Reconnect BAR if needed, refresh BAR tools, and update BAR convenience wrappers.")
+    def bar_refresh_tools() -> str:
+        names = bar_backend.refresh_tools()
+        return f"BAR tools refreshed ({len(names)}): {', '.join(names)}"
+
+    @server.tool(description="Reconnect Tracy MCP if needed, refresh Tracy tools, and update Tracy convenience wrappers.")
+    def tracy_refresh_tools() -> str:
+        names = tracy_backend.refresh_tools()
+        return f"Tracy tools refreshed ({len(names)}): {', '.join(names)}"
+
+    @server.tool(description="Profile a LuaUI widget: reconnect backends as needed, reload it, wait, then collect Tracy zone stats.")
+    def profile_widget(name: str, duration: float = 5.0) -> str:
+        return _run_profile_with_retry(bar_backend, tracy_backend, notifier, name, duration, "widget_reload", diff=False)
+
+    @server.tool(description="Profile a LuaRules gadget: reconnect backends as needed, reload it, wait, then collect Tracy zone stats.")
+    def profile_gadget(name: str, duration: float = 5.0) -> str:
+        return _run_profile_with_retry(bar_backend, tracy_backend, notifier, name, duration, "gadget_reload", diff=False)
+
+    @server.tool(description="Run two profiling passes on a widget with reconnects as needed and return the delta.")
+    def profile_widget_diff(name: str, duration: float = 5.0) -> str:
+        return _run_profile_with_retry(bar_backend, tracy_backend, notifier, name, duration, "widget_reload", diff=True)
+
+    @server.tool(description="Run two profiling passes on a gadget with reconnects as needed and return the delta.")
+    def profile_gadget_diff(name: str, duration: float = 5.0) -> str:
+        return _run_profile_with_retry(bar_backend, tracy_backend, notifier, name, duration, "gadget_reload", diff=True)
+
 
 
 def main() -> None:
@@ -2079,259 +2620,23 @@ def main() -> None:
     logger.info("Transport:    %s", args.transport)
     logger.info("=" * 60)
 
-    # ------------------------------------------------------------------
-    # Tracy MCP lifecycle (Phase 2.2)
-    # ------------------------------------------------------------------
-    tracy_auto = TracyAutoStart(host=TRACY_HOST, port=TRACY_PORT)
-    tracy_client: Optional[TracyHttpClient] = None
-    tracy_instance_id: Optional[str] = None
-
-    if tracy_auto.ensure_running():
-        tracy_client = TracyHttpClient(TRACY_HOST, TRACY_PORT)
-        try:
-            tracy_client.connect()
-            # Auto-connect to the engine's Tracy server
-            tracy_instance_id = tracy_auto.auto_connect(
-                tracy_client,
-                address="127.0.0.1",
-                port=8086,
-                alias="live_engine",
-            )
-            # auto_connect now returns the instance ID directly (e.g. "live_engine")
-            if tracy_instance_id:
-                logger.info("Tracy instance ID: %s", tracy_instance_id)
-        except TracyConnectionError as exc:
-            logger.warning("Tracy MCP connection failed (non-fatal): %s", exc)
-            logger.warning("BAR tools will still work without Tracy")
-
-    else:
-        logger.info("Tracy MCP not available — BAR tools only mode")
-
-    # ------------------------------------------------------------------
-    # BAR MCP connection
-    # ------------------------------------------------------------------
-    bar_client = BarTcpClient(BAR_HOST, BAR_PORT)
-    bar_registry = BarToolRegistry(bar_client)
-
-    def bar_monitor():
-        """Background thread to maintain BAR connection and update tools."""
-        while True:
-            try:
-                if not bar_client.connected:
-                    logger.info("BAR monitor: Attempting to connect to BAR MCP...")
-                    bar_client.connect()
-                    logger.info("BAR monitor: Connected to BAR MCP!")
-                    # Initialize and discover tools
-                    register_bar_tools(server, bar_client, bar_registry)
-                else:
-                    # Heartbeat check
-                    if not bar_client.ping():
-                        logger.warning("BAR monitor: Heartbeat failed, marking as disconnected")
-                        bar_client._cleanup_sock() # Force disconnect
-            except Exception as exc:
-                logger.error("BAR monitor error: %s", exc)
-            time.sleep(5)
-
-    # Create the FastMCP server
     server = create_bridge_server()
-    tracy_registry = None # Will be managed by tracy_monitor
-
-    # Start BAR monitor thread
-    threading.Thread(target=bar_monitor, daemon=True).start()
-
-    # ------------------------------------------------------------------
-    # Tracy MCP lifecycle (Phase 2.2)
-    # ------------------------------------------------------------------
-    tracy_auto = TracyAutoStart(host=TRACY_HOST, port=TRACY_PORT)
-    tracy_client: Optional[TracyHttpClient] = None
-
-    def tracy_monitor():
-        """Background thread to maintain Tracy connection and update tools."""
-        nonlocal tracy_client, tracy_registry
-        while True:
-            try:
-                if not tracy_auto.ensure_running():
-                    logger.warning("Tracy monitor: Tracy MCP is not running")
-                else:
-                    if tracy_client is None or not tracy_client.connected:
-                        logger.info("Tracy monitor: Attempting to connect to Tracy MCP...")
-                        tracy_client = TracyHttpClient(TRACY_HOST, TRACY_PORT)
-                        tracy_client.connect()
-                        # Auto-connect to engine
-                        instance_id = tracy_auto.auto_connect(tracy_client, address="127.0.0.1", port=8086, alias="live_engine")
-                        
-                        if tracy_client.connected:
-                            logger.info("Tracy monitor: Connected to Tracy MCP!")
-                            tracy_registry = TracyToolRegistry(tracy_client)
-                            register_tracy_tools(server, bar_registry, tracy_client, tracy_registry, instance_id)
-                    else:
-                        # Heartbeat check (if available) or just keep alive
-                        pass
-            except Exception as exc:
-                logger.error("Tracy monitor error: %s", exc)
-            time.sleep(5)
-
-    # Start Tracy monitor thread
-    threading.Thread(target=tracy_monitor, daemon=True).start()
-
-    # ------------------------------------------------------------------
-    # Dynamic Tracy tool notification mechanism
-    # ------------------------------------------------------------------
-
-    # We need a way to send tools/list_changed notifications to the MCP client
-    # when Tracy tools are discovered or change. FastMCP exposes this via
-    # Context.session.send_tool_list_changed() but only within a tool call context.
-    # We use a shared holder that tool handlers can populate with the session ref.
-
-    class SessionHolder:
-        """Thread-safe holder for the current MCP session reference."""
-        def __init__(self):
-            self._session = None
-            self._lock = threading.Lock()
-
-        @property
-        def session(self):
-            with self._lock:
-                return self._session
-
-        @session.setter
-        def session(self, value):
-            with self._lock:
-                self._session = value
-
-        def send_tool_list_changed(self) -> bool:
-            """Send tools/list_changed notification to the connected client.
-
-            Returns True if notification was sent, False if no session available.
-            """
-            with self._lock:
-                sess = self._session
-            if sess is not None:
-                try:
-                    sess.send_tool_list_changed()
-                    logger.info("Sent tools/list_changed notification to client")
-                    return True
-                except Exception as exc:
-                    logger.warning("Failed to send tools/list_changed: %s", exc)
-                    return False
-            logger.debug("No session available for tools/list_changed notification")
-            return False
-
-        def send_log(self, level: str, logger_name: str, data: Any) -> bool:
-            """Send a log message notification to the connected client.
-
-            Args:
-                level: Log level (debug, info, notice, warning, error, critical, alert, emergency)
-                logger_name: Name of the logger emitting the message
-                data: JSON-serializable data for the log message
-
-            Returns True if notification was sent, False if no session available.
-            """
-            with self._lock:
-                sess = self._session
-            if sess is not None:
-                try:
-                    sess.send_notification("notifications/message", {
-                        "level": level,
-                        "logger": logger_name,
-                        "data": data
-                    })
-                    return True
-                except Exception as exc:
-                    logger.warning("Failed to send log notification: %s", exc)
-                    return False
-            return False
-
-    session_holder = SessionHolder()
-
-    # Wire up BAR notification callback for dynamic tool re-discovery
-    def on_bar_notification(method: str, params: Dict[str, Any]) -> None:
-        """Handle notifications from BAR MCP server."""
-        if method == "notifications/tools/list_changed":
-            logger.info("Received tools/list_changed from BAR MCP — re-discovering tools")
-            try:
-                bar_registry.discover()
-                # Notify our client that the tool list has changed
-                session_holder.send_tool_list_changed()
-            except BarConnectionError as exc:
-                logger.warning("Failed to re-discover BAR tools: %s", exc)
-
-    bar_client.on_notification(on_bar_notification)
-    logger.info("BAR notification callback registered for dynamic tool updates")
-
-    # Wire up Tracy notification callback for dynamic tool re-discovery
-    if tracy_client and tracy_client.connected and tracy_registry:
-        def on_tracy_notification(method: str, params: Dict[str, Any]) -> None:
-            """Handle notifications from Tracy MCP server."""
-            if method == "notifications/tools/list_changed":
-                logger.info("Received tools/list_changed from Tracy MCP — re-discovering tools")
-                try:
-                    tracy_registry.discover()
-                    # Notify our client that the tool list has changed
-                    session_holder.send_tool_list_changed()
-                except TracyConnectionError as exc:
-                    logger.warning("Failed to re-discover Tracy tools: %s", exc)
-
-        tracy_client.on_notification(on_tracy_notification)
-        logger.info("Tracy notification callback registered for dynamic tool updates")
-
-    # Add a tool that captures the session context on first call, so we can
-    # send notifications from background threads (e.g. Tracy SSE reader).
-    # FastMCP's Context is only valid during a request, so we capture the
-    # session reference when any tool is invoked.
-    def _ensure_session_captured(fn):
-        """Decorator that captures the MCP session on first tool call."""
-        def wrapper(*args, **kwargs):
-            # Try to get context from kwargs (FastMCP injects it)
-            for key, val in kwargs.items():
-                if hasattr(val, "session"):
-                    session_holder.session = val.session
-                    logger.debug("Captured MCP session via %s", key)
-                    break
-            return fn(*args, **kwargs)
-        wrapper.__name__ = fn.__name__
-        wrapper.__doc__ = fn.__doc__
-        wrapper.__annotations__ = fn.__annotations__
-        return wrapper
-
-    # Also add dedicated tools to refresh BAR and Tracy tools on demand
-    @server.tool(
-        description=(
-            "Refresh the list of available BAR MCP tools. "
-            "Useful if BAR MCP tools have changed since the bridge started. "
-            "Sends a tools/list_changed notification to the client."
-        )
+    notifier = ToolListNotifier()
+    bar_backend = BarBackendSupervisor(server, notifier, BAR_HOST, BAR_PORT)
+    tracy_backend = TracyBackendSupervisor(
+        server,
+        notifier,
+        TRACY_HOST,
+        TRACY_PORT,
+        engine_address=TRACY_ENGINE_HOST,
+        engine_port=TRACY_ENGINE_PORT,
+        engine_alias=TRACY_ENGINE_ALIAS,
     )
-    def bar_refresh_tools() -> str:
-        """Refresh BAR tool list and notify client."""
-        try:
-            bar_registry.discover()
-            session_holder.send_tool_list_changed()
-            names = ", ".join(bar_registry.tool_names)
-            return f"BAR tools refreshed: {names}"
-        except BarConnectionError as exc:
-            return f"Failed to refresh BAR tools: {exc}"
 
-    # Also add a dedicated tool to refresh Tracy tools on demand
-    if tracy_registry:
-        @server.tool(
-            description=(
-                "Refresh the list of available Tracy MCP tools. "
-                "Useful if Tracy MCP tools have changed since the bridge started. "
-                "Sends a tools/list_changed notification to the client."
-            )
-        )
-        def tracy_refresh_tools() -> str:
-            """Refresh Tracy tool list and notify client."""
-            try:
-                tracy_registry.discover()
-                session_holder.send_tool_list_changed()
-                names = ", ".join(tracy_registry.tool_names)
-                return f"Tracy tools refreshed: {names}"
-            except TracyConnectionError as exc:
-                return f"Failed to refresh Tracy tools: {exc}"
+    register_stable_bridge_tools(server, bar_backend, tracy_backend, notifier)
+    bar_backend.start()
+    tracy_backend.start()
 
-    # Run the server
     try:
         if args.transport == "sse":
             port = args.port if args.port else 47381
@@ -2343,7 +2648,8 @@ def main() -> None:
     except KeyboardInterrupt:
         logger.info("Shutting down (Ctrl+C)")
     finally:
-        bar_client.disconnect()
+        bar_backend.stop()
+        tracy_backend.stop()
 
 
 if __name__ == "__main__":

@@ -89,6 +89,7 @@ local MCP_PORT    = 23452
 local MCP_HOST    = "127.0.0.1"
 local MCP_VERSION = "2025-11-25"
 local VFS_CAP     = 512 * 1024 -- 512 KB read cap
+local MAX_CLIENT_BUFFER = 1024 * 1024 -- Drop clients that send >1 MB without a newline
 
 local Json   = Json or VFS.Include("common/luaUtilities/json.lua")
 local spEcho = Spring.Echo
@@ -160,6 +161,8 @@ local function drainPendingSends()
 			-- Real error (closed, reset, etc.)
 			table.remove(pendingSends, i)
 			spEcho("[BARMCP] send error: " .. tostring(err))
+			pcall(function() ps.sock:close() end)
+			removeClient(ps.sock)
 		end
 	end
 end
@@ -301,10 +304,20 @@ local function tool_game_info(args)
 	return ok and enc or "{}"
 end
 
+local function tool_ping(args)
+	return "pong"
+end
+
 --------------------------------------------------------------------------------
 -- Tool registry
 --------------------------------------------------------------------------------
 local TOOLS = {
+	{
+		name        = "ping",
+		description = "Heartbeat check for the BAR MCP TCP connection.",
+		inputSchema = {type="object", properties={}},
+		handler     = tool_ping,
+	},
 	{
 		name        = "lua_eval",
 		description = "Execute Lua code in the unsynced LuaUI widget environment. Returns the serialized return value(s).",
@@ -545,6 +558,12 @@ function widget:Update(dt)
 				for _, c in ipairs(clients) do
 					if c.sock == sock then
 						c.buffer = c.buffer .. chunk
+						if #c.buffer > MAX_CLIENT_BUFFER then
+							spEcho("[BARMCP] client buffer exceeded " .. tostring(MAX_CLIENT_BUFFER) .. " bytes without newline; disconnecting")
+							pcall(function() sock:close() end)
+							removeClient(sock)
+							break
+						end
 						while true do
 							local nl = c.buffer:find("\n", 1, true)
 							if not nl then break end
