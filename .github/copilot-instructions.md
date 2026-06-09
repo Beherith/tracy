@@ -266,6 +266,10 @@ pybind11-based Python bindings for both the **Tracy client** (instrumenting Pyth
 | `pyproject.toml` | Build config via `scikit-build-core`, requires Python 3.10+. |
 | `CMakeLists.txt` | Fetches pybind11 v2.13.6, builds two shared modules. |
 
+**Build Instructions:**
+- **WSL (Ubuntu 24.04):** Install system dependencies (`python3.12-venv`, `pkg-config`, `libdbus-1-dev`, `libssl-dev`, `build-essential`, `cmake`, `ninja-build`), create a venv, install `scikit-build-core`, apply fixes to `CMakeLists.txt` (add `C` language support) and `pyproject.toml` (fix install directories), then `pip install .`.
+- **Windows:** Install Visual Studio 2022 (C++ workload), CMake, and Python 3.10+. Create a venv in `python/`, install `scikit-build-core`, and run `pip install .`.
+
 ---
 
 ### `dtl/` — Diff Template Library
@@ -435,26 +439,6 @@ Contains CMakeLists.txt and src/ directory for update/upgrade tooling.
 - **Optional target:** `TracyClientF90` (Fortran bindings, via `TRACY_Fortran`)
 - **Alias targets:** `Tracy::TracyClient`, `Tracy::TracyClient_Fortran`
 
-**Key CMake options:**
-| Option | Default | Description |
-|--------|---------|-------------|
-| `TRACY_STATIC` | ON | Build as static library |
-| `TRACY_Fortran` | OFF | Build Fortran bindings |
-| `TRACY_LTO` | OFF | Enable Link-Time Optimization |
-| `TRACY_ENABLE` | OFF | Enable profiling (must be ON for zones to work) |
-| `TRACY_ON_DEMAND` | OFF | On-demand profiling (enable/disable at runtime) |
-| `TRACY_CALLSTACK` | (empty) | Override callstack depth |
-| `TRACY_NO_CALLSTACK` | OFF | Disable callstack collection |
-| `TRACY_NO_SAMPLING` | OFF | Disable call stack sampling |
-| `TRACY_NO_CONTEXT_SWITCH` | OFF | Disable context switch capture |
-| `TRACY_NO_FRAME_IMAGE` | OFF | Disable frame image/screenshot capture |
-| `TRACY_NO_SYSTEM_TRACING` | OFF | Disable systrace sampling |
-| `TRACY_NO_CODE_TRANSFER` | OFF | Disable source code collection |
-| `TRACY_DELAYED_INIT` | OFF | Delay init until first call |
-| `TRACY_MANUAL_LIFETIME` | OFF | Manual lifetime management |
-| `TRACY_FIBERS` | OFF | Enable fibers support |
-| `TRACY_LIBUNWIND_BACKTRACE` | OFF | Use libunwind for backtracing |
-| `TRACY_DEBUGINFOD` | OFF | Enable debuginfod support |
 
 ### Meson (`meson.build`, `meson.options`)
 - **Minimum version:** Meson 1.3.0
