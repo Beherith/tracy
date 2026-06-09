@@ -2,14 +2,21 @@
 
 This document outlines the test strategy for the tools and resources provided by the MCP server called: `BAR-MCP-Bridge`.
 
+The task is to test each tool one by one. 
+
+# Debug logs
+
+Read these as needed if any MCP server calls result in oddiites.
+
+The BAR MCP lua server ingame lives in `C:\Users\Peti\Documents\My Games\Spring\games\Beyond-All-Reason.sdd\luaui\Widgets\dbg_bar_mcp.lua`
+
+The infolog from the BAR engine is here: `C:\Users\Peti\Documents\My Games\Spring\engine\recoil_2026.06.04\infolog.txt`
+
+The bar_tracy_bridge.py logs here: `N:\github\tracy\extra\mcp\bar_tracy_bridge.log`
+
+
 
 ## Tool Test Cases
-
-### 1. `list_captures`
-**Purpose**: List `.tracy` files in `TRACY_CAPTURES_DIR`.
-- [ ] **Success Case**: Set `TRACY_CAPTURES_DIR` to a folder with 3 `.tracy` files. Verify the tool returns a list of 3 strings.
-- [ ] **Empty Case**: Set `TRACY_CAPTURES_DIR` to an empty folder. Verify it returns an empty list `[]`.
-- [ ] **Missing Env Var**: Unset `TRACY_CAPTURES_DIR`. Verify it returns `[]`.
 
 ### 2. `list_instances`
 **Purpose**: List all loaded Tracy instances.
@@ -26,17 +33,6 @@ This document outlines the test strategy for the tools and resources provided by
 - [ ] **Success Case**: Start a Tracy client on port 8086. Call `live_connect(port=8086)`. Verify it returns a success message with a generated alias.
 - [ ] **Protocol Mismatch**: Start a Tracy client with a different protocol version. Verify it returns a "Protocol mismatch" error message.
 - [ ] **Connection Refused**: Call `live_connect` on a port where no client is running. Verify it returns a "Handshake failed" error with a hint.
-
-### 5. `load_capture`
-**Purpose**: Load a `.tracy` file from disk.
-- [ ] **Success Case**: Provide a valid absolute path to a `.tracy` file. Verify it returns a success message with a unique alias.
-- [ ] **File Not Found**: Provide a non-existent path. Verify it returns a "Failed to load" error.
-- [ ] **Duplicate Alias**: Load a file with a specific alias, then try to load another file with the same alias. Verify it returns "already loaded and up to date" if the file is the same, or overwrites if different.
-
-### 6. `unload_capture`
-**Purpose**: Unload an instance.
-- [ ] **Success Case**: Load an instance, then call `unload_capture(instance_id)`. Verify it returns a success message.
-- [ ] **Invalid ID**: Call with a non-existent ID. Verify it returns "Instance ... not found."
 
 ### 7. `eval`
 **Purpose**: Execute Python code against a worker.

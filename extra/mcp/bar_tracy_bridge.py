@@ -54,9 +54,9 @@ logger.setLevel(getattr(logging, _LOG_LEVEL, logging.INFO))
 
 formatter = logging.Formatter("[%(asctime)s] [BRIDGE] %(levelname)-5s %(message)s", datefmt="%H:%M:%S")
 
-_stdout_handler = logging.StreamHandler(sys.stdout)
-_stdout_handler.setFormatter(formatter)
-logger.addHandler(_stdout_handler)
+_stderr_handler = logging.StreamHandler(sys.stderr)
+_stderr_handler.setFormatter(formatter)
+logger.addHandler(_stderr_handler)
 
 _file_handler = logging.FileHandler(os.path.join(_HERE, "bar_tracy_bridge.log"), encoding="utf-8")
 _file_handler.setFormatter(formatter)
@@ -1263,7 +1263,6 @@ class TracyAutoStart:
         addr = f"{self._host}:{self._port}"
 
         if self._is_running():
-            logger.info("Tracy MCP already running (PID file: %s)", self._pid_file)
             return True
 
         if not auto_start:
@@ -1841,10 +1840,7 @@ function foo(bar)
     tracy.ZoneEnd()
 end
     '''
-
-    """
-
-    )
+    """)
     return server
 
 
@@ -1883,7 +1879,10 @@ def register_bar_tools(server: Any, bar_client: BarTcpClient, bar_registry: BarT
         return "Any"
 
     def _schema_default(prop: Dict[str, Any], py_type: str) -> str:
-        if "default" in prop: return json.dumps(prop["default"])
+        if "default" in prop:
+            val = prop["default"]
+            if isinstance(val, bool): return str(val)
+            return "None" if val is None else json.dumps(val)
         if py_type == "str": return '""'
         if py_type == "int": return "0"
         if py_type == "float": return "0.0"
@@ -1906,9 +1905,9 @@ def register_bar_tools(server: Any, bar_client: BarTcpClient, bar_registry: BarT
             annotations[pname] = py_type
             default = _schema_default(prop, py_type)
             if pname in required:
-                params.append((pname, f"{pname}: {py_type}", True))
+                params.append(( pname, f"{pname}: {py_type}", True))
             else:
-                params.append((pname, f"{pname}: {py_type} = {default}", False))
+                params.append(( pname, f"{pname}: {py_type} = {default}", False))
         params.sort(key=lambda x: (not x[2], x[0]))
         param_signatures = [p[1] for p in params]
 
@@ -1944,7 +1943,7 @@ def {tool_name}({param_str}) -> str:
         except Exception as reg_err:
             logger.error("Failed to register BAR tool '%s': %s", tool_name, reg_err)
 
-def register_tracy_tools(server: Any, tracy_client: TracyHttpClient, tracy_registry: TracyToolRegistry, tracy_instance_id: Optional[str]):
+def register_tracy_tools(server: Any, bar_registry: BarToolRegistry, tracy_client: TracyHttpClient, tracy_registry: TracyToolRegistry, tracy_instance_id: Optional[str]):
     """Discover and register Tracy tools on the MCP server."""
     if not tracy_client.connected:
         return
@@ -1963,7 +1962,10 @@ def register_tracy_tools(server: Any, tracy_client: TracyHttpClient, tracy_regis
         return "Any"
 
     def _schema_default(prop: Dict[str, Any], py_type: str) -> str:
-        if "default" in prop: return json.dumps(prop["default"])
+        if "default" in prop:
+            val = prop["default"]
+            if isinstance(val, bool): return str(val)
+            return "None" if val is None else json.dumps(val)
         if py_type == "str": return '""'
         if py_type == "int": return "0"
         if py_type == "float": return "0.0"
@@ -1975,7 +1977,8 @@ def register_tracy_tools(server: Any, tracy_client: TracyHttpClient, tracy_regis
         tool_desc = tool_def.get("description", "")
         input_schema = tool_def.get("inputSchema", {})
         properties = input_schema.get("properties", {})
-        if not isinstance(properties, dict): properties = {}
+        if not isinstance(properties, dict):
+            properties = {}
         required = set(input_schema.get("required", []))
 
         params: List[str] = []
@@ -1986,9 +1989,9 @@ def register_tracy_tools(server: Any, tracy_client: TracyHttpClient, tracy_regis
             annotations[pname] = py_type
             default = _schema_default(prop, py_type)
             if pname in required:
-                params.append((pname, f"{pname}: {py_type}", True))
+                params.append(( pname, f"{pname}: {py_type}", True))
             else:
-                params.append((pname, f"{pname}: {py_type} = {default}", False))
+                params.append(( pname, f"{pname}: {py_type} = {default}", False))
         params.sort(key=lambda x: (not x[2], x[0]))
         param_signatures = [p[1] for p in params]
 
@@ -2022,7 +2025,7 @@ def tracy_{tool_name}({param_str}) -> str:
             func.__annotations__.update(annotations)
             server.tool(f"tracy_{tool_name}", description=tool_desc)(func)
         except Exception as reg_err:
-            logger.error("Failed to register Tracy tool '%s': %s", tool_name, reg_err)
+            logger.error("Failed to register Tracy tool '%s': %s\nSource:\n%s", tool_name, reg_err, func_source)
 
     if tracy_instance_id:
         profile_collector = ProfileCollector(bar_registry, tracy_client, tracy_instance_id)
@@ -2043,294 +2046,11 @@ def tracy_{tool_name}({param_str}) -> str:
         def profile_gadget_diff(name: str, duration: float = 5.0) -> str:
             return profile_collector.profile_diff(name, duration, reload_tool="gadget_reload")
 
-    # ------------------------------------------------------------------
-    # Helper: build a Python type hint string from a JSON Schema type
-    # ------------------------------------------------------------------
-    def _schema_type_to_python(t: str) -> str:
-        if t == "string":
-            return "str"
-        if t == "integer":
-            return "int"
-        if t == "number":
-            return "float"
-        if t == "boolean":
-            return "bool"
-        return "Any"
-
-    # ------------------------------------------------------------------
-    # Helper: build a default-value string from a JSON Schema property
-    # ------------------------------------------------------------------
-    def _schema_default(prop: Dict[str, Any], py_type: str) -> str:
-        if "default" in prop:
-            return json.dumps(prop["default"])
-        # Heuristic defaults
-        if py_type == "str":
-            return '""'
-        if py_type == "int":
-            return "0"
-        if py_type == "float":
-            return "0.0"
-        if py_type == "bool":
-            return "False"
-        return "None"
-
-    # ------------------------------------------------------------------
-    # Register each BAR tool as an MCP tool on the bridge server
-    # ------------------------------------------------------------------
-    # We generate a real Python function per tool with:
-    #   - __name__ == tool_name  (so FastMCP picks up the correct name)
-    #   - typed parameters from inputSchema  (so FastMCP exposes a real schema)
-    #   - proper docstring
-    # This avoids the "all tools named handler" bug and **kwargs schema loss.
-    for tool_def in bar_registry.tools:
-        tool_name = tool_def["name"]
-        logger.info("Registering BAR tool as: %s, with description: %s", tool_name, tool_def.get("description", ""))
-        tool_desc = tool_def.get("description", "")
-        input_schema = tool_def.get("inputSchema", {})
-        properties = input_schema.get("properties", {})
-        # Some tools may have properties as a list or missing — normalize to dict
-        if not isinstance(properties, dict):
-            properties = {}
-        required = set(input_schema.get("required", []))
-
-        # Build parameter list:  name: type = default
-        # Required params must come before optional ones (Python syntax rule)
-        params: List[str] = []
-        annotations: Dict[str, str] = {}
-        for pname, prop in properties.items():
-            raw_type = prop.get("type", "string")
-            py_type = _schema_type_to_python(raw_type)
-            annotations[pname] = py_type
-            default = _schema_default(prop, py_type)
-            if pname in required:
-                params.append(( pname, f"{pname}: {py_type}", True))
-            else:
-                params.append(( pname, f"{pname}: {py_type} = {default}", False))
-        # Sort: required (True) first, then optional (False)
-        params.sort(key=lambda x: (not x[2], x[0]))
-        param_signatures = [p[1] for p in params]
-
-        # Build source for a real function with typed signature
-        param_str = ", ".join(param_signatures) if param_signatures else ""
-        # Extract just param names to build the _args dict literal
-        # Keys must be quoted string literals, values are the parameter variables
-        param_names = [p[0] for p in params]
-        kwargs_expr = "{" + ", ".join(f'"{p}": {p}' for p in param_names) + "}" if param_names else "{}"
-
-        func_source = f'''
-def {tool_name}({param_str}) -> str:
-    """{tool_desc}"""
-    _args = {kwargs_expr}
-    logger.debug("[BRIDGE:FUNC] '{tool_name}' _args type={{_args.__class__.__name__}} value={{_args}}")
-    try:
-        logger.info("Calling BAR tool '{tool_name}' with args: %s", _args)
-        result = bar_registry.call_tool({tool_name!r}, _args, timeout=120.0)
-        logger.info("BAR tool '{tool_name}' result: %s", _preview_text(result))
-        return result
-    except BarConnectionError as exc:
-        # Only reconnect on actual transport errors (connection reset, etc.),
-        # NOT on timeouts — timeouts mean the game is slow (widget:Update runs
-        # at game framerate), and reconnecting kills the TCP connection the
-        # Lua side is still using.
-        if "Timeout" in str(exc):
-            logger.warning("BAR tool '%s' timed out (game may be paused or slow): %s", {tool_name!r}, exc)
-            raise
-        logger.warning("BAR tool '%s' failed, attempting reconnect: %s", {tool_name!r}, exc)
-        try:
-            bar_client.reconnect()
-            bar_registry.discover()
-            return bar_registry.call_tool({tool_name!r}, _args, timeout=120.0)
-        except BarConnectionError as exc2:
-            raise BarConnectionError(
-                f"BAR tool '{tool_name}' failed after reconnect: {{exc2}}"
-            ) from exc2
-'''
-        try:
-            namespace: Dict[str, Any] = {
-                "bar_registry": bar_registry,
-                "bar_client": bar_client,
-                "BarConnectionError": BarConnectionError,
-                "logger": logger,
-                "_preview_text": _preview_text,
-            }
-            exec(func_source, namespace)
-            func = namespace[tool_name]
-
-            # Set proper metadata
-            func.__name__ = tool_name
-            func.__doc__ = tool_desc
-            func.__annotations__["return"] = str
-            func.__annotations__.update(annotations)
-
-            # Register with FastMCP using explicit name
-            server.tool(tool_name, description=tool_desc)(func)
-            logger.info("Registered BAR tool: %s (params: %s)", tool_name, param_str or "(none)")
-        except Exception as reg_err:
-            logger.error("Failed to register BAR tool '%s': %s\nSource:\n%s", tool_name, reg_err, func_source)
-
-    # ------------------------------------------------------------------
-    # Phase 2.3 — Dynamic Tracy tool discovery & registration
-    # ------------------------------------------------------------------
-    tracy_registry: Optional[TracyToolRegistry] = None
-
-    if tracy_client and tracy_client.connected:
-        logger.info("Registering dynamic Tracy pass-through tools (connection status: %s)", tracy_client.connected)
-
-        # Create registry and discover tools from Tracy MCP
-        tracy_registry = TracyToolRegistry(tracy_client)
-        try:
-            tracy_registry.discover()
-        except TracyConnectionError as exc:
-            logger.warning("Failed to discover Tracy MCP tools: %s", exc)
-
-        # Register each Tracy tool dynamically (same pattern as BAR tools)
-        for tool_def in tracy_registry.tools:
-            tool_name = tool_def["name"]
-            tool_desc = tool_def.get("description", "")
-            input_schema = tool_def.get("inputSchema", {})
-            properties = input_schema.get("properties", {})
-            if not isinstance(properties, dict):
-                properties = {}
-            required = set(input_schema.get("required", []))
-
-            # Build parameter list
-            params: List[str] = []
-            annotations: Dict[str, str] = {}
-            for pname, prop in properties.items():
-                raw_type = prop.get("type", "string")
-                py_type = _schema_type_to_python(raw_type)
-                annotations[pname] = py_type
-                default = _schema_default(prop, py_type)
-                if pname in required:
-                    params.append((pname, f"{pname}: {py_type}", True))
-                else:
-                    params.append((pname, f"{pname}: {py_type} = {default}", False))
-            params.sort(key=lambda x: (not x[2], x[0]))
-            param_signatures = [p[1] for p in params]
-
-            param_str = ", ".join(param_signatures) if param_signatures else ""
-            param_names = [p[0] for p in params]
-            kwargs_expr = "{" + ", ".join(f'"{p}": {p}' for p in param_names) + "}" if param_names else "{}"
-
-            func_source = f'''
-def tracy_{tool_name}({param_str}) -> str:
-    """{tool_desc}"""
-    _args = {kwargs_expr}
-    logger.debug("[BRIDGE:TRACY_FUNC] 'tracy_{tool_name}' _args type={{_args.__class__.__name__}} value={{_args}}")
-    try:
-        logger.info("Calling Tracy tool 'tracy_{tool_name}' with args: %s", _args)
-        result = tracy_registry.call_tool({tool_name!r}, _args, timeout=120.0)
-        text = json.dumps(result) if isinstance(result, (dict, list)) else str(result) if result is not None else ""
-        logger.info("Tracy tool 'tracy_{tool_name}' result: %s", _preview_text(text))
-        return text
-    except TracyConnectionError as exc:
-        logger.warning("Tracy tool 'tracy_{tool_name}' failed, attempting reconnect: %s", exc)
-        try:
-            tracy_client.reconnect()
-            tracy_registry.discover()
-            result = tracy_registry.call_tool({tool_name!r}, _args, timeout=120.0)
-            text = json.dumps(result) if isinstance(result, (dict, list)) else str(result) if result is not None else ""
-            return text
-        except TracyConnectionError as exc2:
-            raise TracyConnectionError(
-                f"Tracy tool 'tracy_{tool_name}' failed after reconnect: {{exc2}}"
-            ) from exc2
-'''
-            try:
-                namespace: Dict[str, Any] = {
-                    "tracy_registry": tracy_registry,
-                    "tracy_client": tracy_client,
-                    "TracyConnectionError": TracyConnectionError,
-                    "logger": logger,
-                    "_preview_text": _preview_text,
-                    "json": json,
-                }
-                exec(func_source, namespace)
-                func = namespace[f"tracy_{tool_name}"]
-
-                func.__name__ = f"tracy_{tool_name}"
-                func.__doc__ = tool_desc
-                func.__annotations__["return"] = str
-                func.__annotations__.update(annotations)
-
-                server.tool(f"tracy_{tool_name}", description=tool_desc)(func)
-                logger.info("Registered Tracy tool: tracy_%s (params: %s)", tool_name, param_str or "(none)")
-            except Exception as reg_err:
-                logger.error("Failed to register Tracy tool '%s': %s\nSource:\n%s", tool_name, reg_err, func_source)
-
-        logger.info("Dynamic Tracy tools registered: %s", ", ".join(f"tracy_{t}" for t in tracy_registry.tool_names))
-
-        # ------------------------------------------------------------------
-        # Phase 3 — Profile Tools (only available when both BAR + Tracy connected)
-        # ------------------------------------------------------------------
-        if tracy_instance_id:
-            profile_collector = ProfileCollector(
-                bar_registry, tracy_client, tracy_instance_id
-            )
-
-            @server.tool(
-                description=(
-                    "Profile a LuaUI widget: reload it, wait for zone data to accumulate, "
-                    "then collect Tracy zone stats. Zones are matched by name prefix "
-                    "(e.g., widget 'Example_Widget' matches zones named 'Example_Widget:*'). "
-                    "The widget should be instrumented with tracy.ZoneBeginN('WidgetName:func') "
-                    "/ tracy.ZoneEnd() for profiling to work."
-                )
-            )
-            def profile_widget(name: str, duration: float = 5.0) -> str:
-                """Profile a widget: reload → wait → collect zone stats."""
-                return profile_collector.profile_widget(name, duration)
-
-            @server.tool(
-                description=(
-                    "Profile a LuaRules gadget: reload it, wait for zone data to accumulate, "
-                    "then collect Tracy zone stats. Zones are matched by name prefix. "
-                    "The gadget should be instrumented with tracy.ZoneBeginN('GadgetName:func') "
-                    "/ tracy.ZoneEnd() for profiling to work."
-                )
-            )
-            def profile_gadget(name: str, duration: float = 5.0) -> str:
-                """Profile a gadget: reload → wait → collect zone stats."""
-                return profile_collector.profile_gadget(name, duration)
-
-            @server.tool(
-                description=(
-                    "Run two profiling passes on a widget and return the delta. "
-                    "Useful for measuring the impact of a code change. "
-                    "First pass profiles current state, second pass profiles after reload. "
-                    "The delta shows improvement (negative = faster) or regression."
-                )
-            )
-            def profile_widget_diff(name: str, duration: float = 5.0) -> str:
-                """Diff profile a widget: two passes with delta."""
-                return profile_collector.profile_diff(
-                    name, duration, reload_tool="widget_reload"
-                )
-
-            @server.tool(
-                description=(
-                    "Run two profiling passes on a gadget and return the delta. "
-                    "Useful for measuring the impact of a code change. "
-                    "First pass profiles current state, second pass profiles after reload. "
-                    "The delta shows improvement (negative = faster) or regression."
-                )
-            )
-            def profile_gadget_diff(name: str, duration: float = 5.0) -> str:
-                """Diff profile a gadget: two passes with delta."""
-                return profile_collector.profile_diff(
-                    name, duration, reload_tool="gadget_reload"
-                )
-
-            logger.info("Profile tools registered: profile_widget, profile_gadget, profile_widget_diff, profile_gadget_diff")
-        else:
-            logger.info(
-                "Tracy instance_id not available — profile tools not registered. "
-                "Ensure Tracy MCP auto-connects successfully."
-            )
-
+        logger.info("Profile tools registered: profile_widget, profile_gadget, profile_widget_diff, profile_gadget_diff")
     else:
         logger.info(
-            "Tracy MCP not connected — Tracy tools and profile tools not registered."
+            "Tracy instance_id not available — profile tools not registered. "
+            "Ensure Tracy MCP auto-connects successfully."
         )
 
     return server, tracy_registry
@@ -2443,7 +2163,7 @@ def main() -> None:
                         if tracy_client.connected:
                             logger.info("Tracy monitor: Connected to Tracy MCP!")
                             tracy_registry = TracyToolRegistry(tracy_client)
-                            register_tracy_tools(server, tracy_client, tracy_registry, instance_id)
+                            register_tracy_tools(server, bar_registry, tracy_client, tracy_registry, instance_id)
                     else:
                         # Heartbeat check (if available) or just keep alive
                         pass
@@ -2495,6 +2215,31 @@ def main() -> None:
                     logger.warning("Failed to send tools/list_changed: %s", exc)
                     return False
             logger.debug("No session available for tools/list_changed notification")
+            return False
+
+        def send_log(self, level: str, logger_name: str, data: Any) -> bool:
+            """Send a log message notification to the connected client.
+
+            Args:
+                level: Log level (debug, info, notice, warning, error, critical, alert, emergency)
+                logger_name: Name of the logger emitting the message
+                data: JSON-serializable data for the log message
+
+            Returns True if notification was sent, False if no session available.
+            """
+            with self._lock:
+                sess = self._session
+            if sess is not None:
+                try:
+                    sess.send_notification("notifications/message", {
+                        "level": level,
+                        "logger": logger_name,
+                        "data": data
+                    })
+                    return True
+                except Exception as exc:
+                    logger.warning("Failed to send log notification: %s", exc)
+                    return False
             return False
 
     session_holder = SessionHolder()

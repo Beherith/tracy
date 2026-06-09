@@ -594,11 +594,6 @@ if __name__ == "__main__":
 
     running, existing_port = _is_our_server_running()
     if running:
-        print(
-            f"Tracy MCP already running on port {existing_port}. "
-            "All VS Code windows share that instance.",
-            file=sys.stderr,
-        )
         sys.exit(0)
 
     port = _find_free_port()
