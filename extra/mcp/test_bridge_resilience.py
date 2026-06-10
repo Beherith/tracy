@@ -311,7 +311,7 @@ class BridgeResilienceTests(unittest.TestCase):
         self.assertEqual(bar.state, "ready")
         self.assertTrue(bar.client.connected)
 
-    def test_tracy_supervisor_recovers_and_updates_tool_wrappers(self):
+    def test_tracy_supervisor_recovers_without_exposing_raw_tool_wrappers(self):
         try:
             import httpx  # noqa: F401
         except ImportError:
@@ -326,7 +326,7 @@ class BridgeResilienceTests(unittest.TestCase):
 
         tracy = TracyBackendSupervisor(server, notifier, port=port)
         tracy.ensure_mcp_ready()
-        self.assertIn("tracy_eval", server._tool_manager._tools)
+        self.assertNotIn("tracy_eval", server._tool_manager._tools)
         self.assertEqual(tracy.ensure_engine_ready(), "live_engine")
 
         tracy_server.stop()
@@ -337,7 +337,7 @@ class BridgeResilienceTests(unittest.TestCase):
         tracy.mark_mcp_offline("test restart")
         names = tracy.refresh_tools()
         self.assertIn("new_stat", names)
-        self.assertIn("tracy_new_stat", server._tool_manager._tools)
+        self.assertNotIn("tracy_new_stat", server._tool_manager._tools)
 
 
 if __name__ == "__main__":

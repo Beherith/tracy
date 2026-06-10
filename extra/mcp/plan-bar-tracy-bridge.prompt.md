@@ -1,6 +1,6 @@
 # Plan: BAR + Tracy MCP Bridge Server
 
-**TL;DR:** Build a Python bridge MCP server (`bar_tracy_bridge.py`) that (1) solves the TCP transport problem by adapting BAR's raw-TCP JSON-RPC to standard MCP stdio/SSE, and (2) exposes a `profile_widget` / `profile_gadget` tool that orchestrates the reload → profile → collect workflow across both MCP servers.
+**TL;DR:** Build a Python bridge MCP server (`bar_tracy_bridge.py`) that (1) solves the TCP transport problem by adapting BAR's raw-TCP JSON-RPC to standard MCP stdio/SSE, and (2) exposes `profile_zone_pattern` tools that orchestrate optional reload → profile → collect workflows across both MCP servers.
 
 ### Core Workflow
 
@@ -9,7 +9,7 @@ The primary use case is an iterative profiling loop:
 ```
 Agent instruments Lua code with tracy.ZoneBeginN("Example_Widget:funcname") / ZoneEnd()
   ↓
-Agent calls profile_widget("Example_Widget", duration=5) on the Bridge
+Agent calls profile_zone_pattern("^Example_Widget:", duration=5) on the Bridge
   ↓
 Bridge:
   1. Clear all Tracy zone stats (fresh measurement)
@@ -129,14 +129,11 @@ The bridge needs robust, structured logging since it sits between 3 components a
 - Extracts instance ID from result message via regex (`as 'live_engine'` → `live_engine`)
 - **Notable implementation detail:** `ensure_running()` returns bool (True/False) — the bridge degrades gracefully to BAR-only mode if Tracy MCP can't start. The process is NOT killed on bridge exit since it may be shared with other tools.
 
-**2.3 — Pass-through Tracy tools** ✅
-- Exposed as MCP tools on the bridge server:
-  - **`tracy_eval(code, instance_id)`** — executes Python code against a Tracy Worker bound as `ctx`. Uses the auto-connected instance_id by default.
-  - **`tracy_list_instances()`** — lists all loaded Tracy instances
-  - **`tracy_discover_instances(port_range)`** — scans for running Tracy applications
-- `live_connect` is handled internally at startup — not exposed as a tool
-- **Deliberately excluded:** `load_capture`, `unload_capture` — file-based profiling is out of scope
-- Tracy tools are only registered if `tracy_client` is connected at server creation time
+**2.3 - Internal Tracy tools**
+- Tracy MCP tools are discovered and called internally by the bridge.
+- `eval`, `list_instances`, and `live_connect` support profiling and reconnect logic.
+- Raw Tracy tools are not exposed as `tracy_*` MCP tools on the bridge server.
+- File/capture-oriented Tracy tools such as `load_capture`/`unload_capture` are intentionally hidden from the client-facing tool list.
 
 #### Phase 3: Profile Tools (the core workflow) ✅ DONE
 
@@ -152,10 +149,8 @@ The bridge needs robust, structured logging since it sits between 3 components a
 - **Notable implementation detail:** Zone stats are keyed by source-location ID (extracted via regex from zone key format `'name (addr)[arch] <srcloc_id>'`), not by name — this avoids ambiguity when the same function is instrumented at multiple call sites
 
 **3.2 — Four MCP tools registered on the bridge server** ✅
-- **`profile_widget(name, duration=5.0)`** — reload widget → wait → collect zone stats
-- **`profile_gadget(name, duration=5.0)`** — reload gadget → wait → collect zone stats
-- **`profile_widget_diff(name, duration=5.0)`** — two passes on a widget, return delta (count diff, total diff, percentage change)
-- **`profile_gadget_diff(name, duration=5.0)`** — two passes on a gadget, return delta
+- **`profile_zone_pattern(zone_pattern, duration=5.0, reload_kind="", reload_name="")`** — optionally reload a widget/gadget → wait → collect matching zone stats
+- **`profile_zone_pattern_diff(zone_pattern, duration=5.0, reload_kind="", reload_name="")`** — two passes for a zone pattern, return delta (count diff, total diff, percentage change)
 - Profile tools only register when both BAR and Tracy are connected with a valid instance_id
 
 **3.3 — Output formatting** ✅
@@ -192,8 +187,8 @@ The bridge needs robust, structured logging since it sits between 3 components a
 ### Verification
 
 1. **TCP adapter test:** Start BAR with MCP widget → connect bridge → call `game_info` → verify response matches BAR output
-2. **Profile workflow test:** Instrument a widget with `tracy.ZoneBeginN("Test:func")` → call `profile_widget("Test", 3)` → verify zone stats are returned with correct prefix filter
-3. **Reload+profile test:** Modify widget code → call `profile_widget("Test", 5)` → verify widget was reloaded AND new zone stats collected
+2. **Profile workflow test:** Instrument a widget with `tracy.ZoneBeginN("Test:func")` → call `profile_zone_pattern("^Test:", 3)` → verify zone stats are returned with correct pattern filter
+3. **Reload+profile test:** Modify widget code → call `profile_zone_pattern("^Test:", 5, reload_kind="widget", reload_name="Test")` → verify widget was reloaded AND new zone stats collected
 4. **Diff test:** Call `profile_diff("Test", 3)` twice with different code → verify delta shows improvement/regression
 
 ### Decisions (Resolved)
@@ -205,11 +200,11 @@ The bridge needs robust, structured logging since it sits between 3 components a
 5. **BAR TCP protocol is opaque** — bridge implements the exact JSON-RPC format from `dbg_bar_mcp.lua`, no Lua changes needed
 6. **Tracy connected via HTTP/SSE** — bridge connects to Tracy's SSE endpoint, keeping processes independent
 7. **Zone prefix convention** — zones use `"WidgetName:funcname"` format as per user's instrumentation pattern
-8. **Profile tools are the primary value** — BAR tool passthrough is secondary; the `profile_widget`/`profile_gadget` tools are the main reason the bridge exists
+8. **Profile tools are the primary value** — BAR tool passthrough is secondary; the `profile_zone_pattern` tools are the main reason the bridge exists
 9. **Robust logging throughout** — all inter-component communication logged at DEBUG level; errors include descriptive messages with actionable guidance (e.g., "check game console for [BARMCP] messages", "is engine built with TRACY_ENABLE?")
 10. **Logging to stderr** — doesn't interfere with stdio MCP transport; level controlled by `BRIDGE_LOG_LEVEL` env var
 11. **Zone stats keyed by source-location ID** — snapshots use srcloc_id (extracted from zone key via regex `<\d+>$`) as the join key, not zone names, to correctly track zones across reloads when the source code changes
-12. **Diff tools use two full passes** — `profile_widget_diff` and `profile_gadget_diff` each run the full reload→wait→collect workflow twice, then compute per-zone delta (count diff, total diff, percentage change, avg before→after)
+12. **Diff tools use two full passes** — `profile_zone_pattern_diff` runs the optional reload→wait→collect workflow twice, then computes per-zone delta (count diff, total diff, percentage change, avg before→after)
 13. **Readable + JSON output format** — profile results include a human-readable table (sorted by total time, capped at 50 zones, times in μs) followed by full JSON for programmatic access
 
 # Improvements:
@@ -267,4 +262,4 @@ After reviewing the design plan, the Lua server implementation, and the Python b
 | **Bridge** | Medium | Replace `exec()` tool generation with a generic dispatcher. |
 | **Lua Server** | Medium | Add a max buffer size to the TCP receiver. |
 | **Lua Server** | Low | Implement a `ping` tool for connection heartbeats. |
-| **Tracy MCP** | Low | Expose structured zone stats to avoid regex parsing in the bridge. 
+| **Tracy MCP** | Low | Expose structured zone stats to avoid regex parsing in the bridge.

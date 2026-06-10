@@ -34,20 +34,18 @@ offline:
 
 - `bridge_status` - JSON health/status for BAR, Tracy MCP, Tracy engine, dynamic
   tool count, generations, and current config.
-- `bridge_dynamic_tools` - currently installed BAR and `tracy_*` convenience
-  wrappers.
+- `bridge_dynamic_tools` - currently installed BAR convenience wrappers.
 - `bridge_reconnect` - force BAR, Tracy MCP, and/or Tracy engine reconnect.
 - `bar_call_tool` - call any BAR tool by name with JSON arguments.
-- `tracy_call_tool` - call any Tracy MCP tool by name with JSON arguments.
 - `bar_refresh_tools` - rediscover BAR tools and replace dynamic wrappers.
-- `tracy_refresh_tools` - rediscover Tracy tools and replace dynamic wrappers.
-- `profile_widget`, `profile_gadget` - lazy reconnect, reload, wait, collect
-  Tracy zones.
-- `profile_widget_diff`, `profile_gadget_diff` - two lazy profiling passes and
-  a delta report.
+- `profile_zone_pattern` - lazy reconnect, optionally reload a widget/gadget,
+  wait, then collect Tracy zones matching a Python regex.
+- `profile_zone_pattern_diff` - two lazy profiling passes for the same zone
+  pattern and an optional reload target.
 
-Dynamic convenience wrappers are also installed for discovered BAR tools and
-Tracy tools. Tracy tools are prefixed with `tracy_`, for example `tracy_eval`.
+Dynamic convenience wrappers are installed for discovered BAR tools only. Tracy
+MCP tools are still discovered for internal bridge operations, but raw Tracy
+tools are not exposed to the MCP client.
 The bridge advertises MCP `tools.listChanged` support and sends
 `notifications/tools/list_changed` when rediscovery changes the dynamic wrapper
 set. If a client does not honor those notifications, use the stable generic
@@ -82,11 +80,12 @@ When Tracy reconnects:
 2. open SSE session
 3. MCP initialize
 4. `tools/list`
-5. install/replace `tracy_*` convenience wrappers
+5. keep discovered Tracy tools internal to the bridge
 6. live engine connection is established lazily when a profiling tool needs it
 
-Profiling tools are always present. They reconnect BAR, Tracy MCP, and the live
-engine instance at call time.
+Profiling tools are always present. They reconnect Tracy MCP and the live
+engine instance at call time; when `reload_kind` is set, they also reconnect BAR
+before calling `widget_reload` or `gadget_reload`.
 
 ## Environment
 
@@ -112,7 +111,7 @@ disk. If the marker is not present in the cached console lines, it falls back to
 
 ## Profiling Convention
 
-Instrument Lua with zones whose names start with the widget/gadget name:
+Instrument Lua with stable, searchable zone names:
 
 ```lua
 tracy.ZoneBeginN("MyWidget:Update")
@@ -125,8 +124,9 @@ Make sure every return path calls `tracy.ZoneEnd()`.
 Then call:
 
 ```text
-profile_widget("MyWidget", duration=5)
-profile_gadget("MyGadget", duration=5)
+profile_zone_pattern("^MyWidget:", duration=5)
+profile_zone_pattern("^MyWidget:", duration=5, reload_kind="widget", reload_name="MyWidget")
+profile_zone_pattern("^MyGadget:", duration=5, reload_kind="gadget", reload_name="MyGadget")
 ```
 
 ## Validation

@@ -1190,10 +1190,11 @@ class TracyHttpClient:
 
 
 class TracyToolRegistry:
-    """Discovers Tracy MCP tools via `tools/list` and provides callable wrappers.
+    """Discovers Tracy MCP tools via `tools/list` for internal bridge use.
 
-    Each discovered tool is exposed as a pass-through call to the Tracy MCP server.
-    Supports dynamic re-discovery when the tool list changes.
+    The bridge deliberately does not expose raw Tracy MCP tools to the client.
+    Profiling is the public surface; discovered Tracy tools stay behind the
+    supervisor so file/capture utilities do not clutter MCP tool lists.
     """
 
     def __init__(self, client: TracyHttpClient):
@@ -1487,11 +1488,7 @@ class TracyAutoStart:
 
 
 class ProfileCollector:
-    """Orchestrates the reload → profile → collect workflow.
-
-    Uses BAR MCP to reload widgets/gadgets and Tracy MCP to collect
-    zone stats filtered by a name prefix.
-    """
+    """Orchestrates optional reload, profiling wait, and Tracy zone collection."""
 
     def __init__(
         self,
@@ -1502,10 +1499,6 @@ class ProfileCollector:
         self._bar = bar_registry
         self._tracy = tracy_client
         self._instance_id = tracy_instance_id
-
-    # ------------------------------------------------------------------
-    # Tracy eval helpers
-    # ------------------------------------------------------------------
 
     def _tracy_eval(self, code: str, timeout: float = 60.0) -> str:
         """Execute Python code against the Tracy Worker via eval tool."""
@@ -1533,18 +1526,14 @@ class ProfileCollector:
         return "\n".join(texts) if texts else str(result)
 
     def _get_zone_stats_snapshot(self) -> Dict[str, Any]:
-        """Capture a snapshot of all zone stats keyed by source-location ID.
-
-        Returns a dict: { srcloc_id: {count, total, min, max, avg} }
-        Only includes zones that have been entered at least once.
-        """
+        """Capture a snapshot of all zone stats keyed by source-location ID."""
         code = """
 import re
 result = {}
 for key, stats in ctx.get_all_zone_stats().items():
     m = re.search(r'<(\\d+)>$', key)
     if m:
-        sid = int(m.group(1))
+        sid = m.group(1)
         result[sid] = {
             'count': stats.count,
             'total': stats.total,
@@ -1562,27 +1551,23 @@ json.dumps(result)
             logger.warning("Tracy eval returned non-JSON for zone snapshot: %s", raw[:200])
             return {}
 
-    def _get_zone_names_by_prefix(self, prefix: str) -> Dict[int, str]:
-        """Get zone source-location IDs and display names matching a prefix.
-
-        Returns a dict: { srcloc_id: display_name }
-        Display name is the human-readable part before ' (addr)'.
-        """
+    def _get_zone_names_by_pattern(self, zone_pattern: str) -> Dict[str, str]:
+        """Get source-location IDs and display names matching a Python regex."""
+        re.compile(zone_pattern)
         code = f"""
 import re
-prefix = {prefix!r}
+zone_re = re.compile({zone_pattern!r})
 result = {{}}
 seen = set()
 for key, stats in ctx.get_all_zone_stats().items():
-    if not key.startswith(prefix):
+    display = key.split(' (')[0] if ' (' in key else key
+    if not (zone_re.search(display) or zone_re.search(key)):
         continue
     m = re.search(r'<(\\d+)>$', key)
     if m:
-        sid = int(m.group(1))
+        sid = m.group(1)
         if sid not in seen:
             seen.add(sid)
-            # Extract display name (part before ' (addr)')
-            display = key.split(' (')[0] if ' (' in key else key
             result[sid] = display
 import json
 json.dumps(result)
@@ -1594,88 +1579,67 @@ json.dumps(result)
             logger.warning("Tracy eval returned non-JSON for zone names: %s", raw[:200])
             return {}
 
-    # ------------------------------------------------------------------
-    # Core profiling workflow
-    # ------------------------------------------------------------------
-
     def _reload_and_profile(
         self,
-        reload_tool: str,
-        name: str,
+        zone_pattern: str,
         duration: float = 5.0,
+        reload_tool: Optional[str] = None,
+        reload_name: Optional[str] = None,
     ) -> Dict[str, Any]:
-        """Execute the full profile workflow: snapshot before → reload → wait → snapshot after → diff.
+        """Profile zones matching a regex, optionally reloading code first."""
+        if duration < 0:
+            raise ValueError("duration must be >= 0")
+        if reload_tool and not reload_name:
+            raise ValueError("reload_name is required when reload_tool is set")
 
-        Args:
-            reload_tool: BAR tool name ("widget_reload" or "gadget_reload")
-            name: Widget/gadget name (also used as zone prefix for filtering)
-            duration: Seconds to wait after reload for zone data to accumulate
-
-        Returns:
-            Dict with zone stats and metadata.
-        """
         logger.info(
-            "Starting profile: %s='%s', duration=%.1fs", reload_tool, name, duration
+            "Starting profile: zone_pattern=%r, reload=%s(%r), duration=%.1fs",
+            zone_pattern,
+            reload_tool or "none",
+            reload_name,
+            duration,
         )
-
-        # Step 1: Take a before-snapshot (baseline)
-        logger.debug("Capturing Tracy zone snapshot (before)…")
         before = self._get_zone_stats_snapshot()
         logger.debug("Before snapshot: %d zones captured", len(before))
 
-        # Step 2: Reload the widget/gadget via BAR MCP
-        logger.info("Reloading via BAR: %s(name='%s')", reload_tool, name)
-        try:
-            reload_result = self._bar.call_tool(reload_tool, {"name": name}, timeout=15.0)
-            logger.info("BAR reload result: %s", reload_result[:200])
-        except BarConnectionError as exc:
-            raise BarConnectionError(
-                f"Failed to reload {name} via BAR MCP: {exc}"
-            ) from exc
+        if reload_tool:
+            logger.info("Reloading via BAR: %s(name=%r)", reload_tool, reload_name)
+            try:
+                reload_result = self._bar.call_tool(reload_tool, {"name": reload_name}, timeout=15.0)
+                logger.info("BAR reload result: %s", reload_result[:200])
+            except BarConnectionError as exc:
+                raise BarConnectionError(
+                    f"Failed to reload {reload_name} via BAR MCP: {exc}"
+                ) from exc
 
-        # Step 3: Wait for the game to run and generate zone data
-        logger.info("Waiting %.1fs for zone data to accumulate…", duration)
+        logger.info("Waiting %.1fs for zone data to accumulate", duration)
         time.sleep(duration)
-        logger.info("Wait period finished.")
-
-        # Step 4: Capture after-snapshot
-        logger.debug("Capturing Tracy zone snapshot (after)…")
         after = self._get_zone_stats_snapshot()
         logger.debug("After snapshot: %d zones captured", len(after))
 
-        # Step 5: Get zone names matching prefix to filter SIDs
-        relevant_zones = self._get_zone_names_by_prefix(name)
-
-        # Step 6: Compute delta — only for zones that match the prefix and have new entries
-        delta = self._compute_delta(before, after, name, relevant_zones)
-        return delta
+        relevant_zones = self._get_zone_names_by_pattern(zone_pattern)
+        result = self._compute_delta(before, after, zone_pattern, relevant_zones)
+        result["reload"] = {"tool": reload_tool, "name": reload_name} if reload_tool else None
+        return result
 
     @staticmethod
     def _compute_delta(
         before: Dict[str, Any],
         after: Dict[str, Any],
-        prefix: str,
-        relevant_zones: Dict[int, str],
+        zone_pattern: str,
+        relevant_zones: Dict[str, str],
     ) -> Dict[str, Any]:
-        """Compute the delta between two zone stat snapshots, filtered by prefix.
-
-        Only includes zones that are in relevant_zones and whose count increased.
-        """
+        """Compute the delta between two zone stat snapshots."""
         zones: Dict[str, Dict[str, Any]] = {}
 
         for sid, display_name in relevant_zones.items():
-            sid_str = str(sid)
-            b = before.get(sid_str, {})
-            a = after.get(sid_str, {})
-
+            b = before.get(sid, {})
+            a = after.get(sid, {})
             b_count = b.get("count", 0)
             a_count = a.get("count", 0)
-
-            # Only include zones that have new entries (count increased)
             if a_count <= b_count:
                 continue
-
-            zones[sid_str] = {
+            zones[sid] = {
                 "name": display_name,
                 "count": a_count - b_count,
                 "total": a.get("total", 0) - b.get("total", 0),
@@ -1684,104 +1648,76 @@ json.dumps(result)
                 "avg": a.get("avg", 0),
             }
 
-        # Format output
         result = {
-            "prefix": prefix,
+            "zone_pattern": zone_pattern,
             "zone_count": len(zones),
             "zones": zones,
         }
-
         if not zones:
             logger.warning(
-                "No Tracy zones found with new entries after profiling '%s' — "
-                "did you instrument with tracy.ZoneBeginN('%s:...') / tracy.ZoneEnd()?",
-                prefix, prefix,
+                "No Tracy zones found with new entries after profiling pattern %r. "
+                "Did you instrument matching tracy.ZoneBeginN(...) / tracy.ZoneEnd() zones?",
+                zone_pattern,
             )
-
         return result
 
-    # ------------------------------------------------------------------
-    # Public API
-    # ------------------------------------------------------------------
-
-    def profile_widget(
-        self, name: str, duration: float = 5.0
+    def profile_zone_pattern(
+        self,
+        zone_pattern: str,
+        duration: float = 5.0,
+        reload_tool: Optional[str] = None,
+        reload_name: Optional[str] = None,
     ) -> str:
-        """Profile a LuaUI widget: reload it, wait, collect zone stats.
-
-        Zones are filtered by the widget name prefix.
-        """
-        result = self._reload_and_profile("widget_reload", name, duration)
-        return self._format_result(result, "widget")
-
-    def profile_gadget(
-        self, name: str, duration: float = 5.0
-    ) -> str:
-        """Profile a LuaRules gadget: reload it, wait, collect zone stats.
-
-        Zones are filtered by the gadget name prefix.
-        """
-        result = self._reload_and_profile("gadget_reload", name, duration)
-        return self._format_result(result, "gadget")
+        """Profile Tracy zones matching a regex, optionally after a BAR reload."""
+        result = self._reload_and_profile(zone_pattern, duration, reload_tool, reload_name)
+        return self._format_result(result)
 
     def profile_diff(
-        self, name: str, duration: float = 5.0, reload_tool: str = "widget_reload"
+        self,
+        zone_pattern: str,
+        duration: float = 5.0,
+        reload_tool: Optional[str] = None,
+        reload_name: Optional[str] = None,
     ) -> str:
-        """Run two profile passes and return the delta.
-
-        First pass profiles the current state, second pass profiles after
-        a reload. The delta shows improvement or regression.
-        """
-        item_type = "gadget" if reload_tool == "gadget_reload" else "widget"
+        """Run two profile passes and return the delta."""
         logger.info(
-            "Starting diff profile: %s='%s', duration=%.1fs", item_type, name, duration
+            "Starting diff profile: zone_pattern=%r, reload=%s(%r), duration=%.1fs",
+            zone_pattern,
+            reload_tool or "none",
+            reload_name,
+            duration,
         )
-
-        # First pass
-        logger.info("Diff profile — first pass")
-        pass1 = self._reload_and_profile(reload_tool, name, duration)
-
-        # Brief pause between passes
+        pass1 = self._reload_and_profile(zone_pattern, duration, reload_tool, reload_name)
         time.sleep(0.5)
-
-        # Second pass
-        logger.info("Diff profile — second pass")
-        pass2 = self._reload_and_profile(reload_tool, name, duration)
-
-        # Compute delta between passes
-        delta = self._compute_pass_delta(pass1, pass2, name)
-        return self._format_diff_result(delta, item_type)
+        pass2 = self._reload_and_profile(zone_pattern, duration, reload_tool, reload_name)
+        delta = self._compute_pass_delta(pass1, pass2, zone_pattern)
+        delta["reload"] = {"tool": reload_tool, "name": reload_name} if reload_tool else None
+        return self._format_diff_result(delta)
 
     @staticmethod
     def _compute_pass_delta(
         pass1: Dict[str, Any],
         pass2: Dict[str, Any],
-        prefix: str,
+        zone_pattern: str,
     ) -> Dict[str, Any]:
         """Compute the delta between two profiling passes."""
         zones1 = pass1.get("zones", {})
         zones2 = pass2.get("zones", {})
-
-        all_ids = set(zones1.keys()) | set(zones2.keys())
         delta_zones: Dict[str, Dict[str, Any]] = {}
 
-        for sid_str in all_ids:
-            z1 = zones1.get(sid_str, {})
-            z2 = zones2.get(sid_str, {})
-
+        for sid in set(zones1.keys()) | set(zones2.keys()):
+            z1 = zones1.get(sid, {})
+            z2 = zones2.get(sid, {})
             c1 = z1.get("count", 0)
             c2 = z2.get("count", 0)
             t1 = z1.get("total", 0)
             t2 = z2.get("total", 0)
-
             count_diff = c2 - c1
             total_diff = t2 - t1
-
-            # Calculate percentage change
             count_pct = (count_diff / c1 * 100) if c1 else 0
             total_pct = (total_diff / t1 * 100) if t1 else 0
-
-            delta_zones[sid_str] = {
+            delta_zones[sid] = {
+                "name": z2.get("name") or z1.get("name"),
                 "count_before": c1,
                 "count_after": c2,
                 "count_diff": count_diff,
@@ -1795,35 +1731,33 @@ json.dumps(result)
             }
 
         return {
-            "prefix": prefix,
+            "zone_pattern": zone_pattern,
             "zone_count": len(delta_zones),
             "zones": delta_zones,
         }
 
-    # ------------------------------------------------------------------
-    # Formatting
-    # ------------------------------------------------------------------
-
     @staticmethod
-    def _format_result(result: Dict[str, Any], item_type: str) -> str:
+    def _format_result(result: Dict[str, Any]) -> str:
         """Format profile result as a readable string with JSON data."""
-        prefix = result["prefix"]
+        zone_pattern = result["zone_pattern"]
         zone_count = result["zone_count"]
         zones = result["zones"]
+        reload_info = result.get("reload")
 
         lines = [
-            f"Profile result for {item_type} '{prefix}':",
+            f"Profile result for zone pattern {zone_pattern!r}:",
             f"  Zones with new entries: {zone_count}",
-            "",
         ]
+        if reload_info:
+            lines.append(f"  Reload: {reload_info['tool']}({reload_info['name']!r})")
+        lines.append("")
 
         if zone_count:
             lines.append("  Zone stats (count, total_us, min_us, max_us, avg_us):")
-            # Sort by total time descending
             sorted_zones = sorted(
                 zones.items(), key=lambda kv: kv[1].get("total", 0), reverse=True
             )
-            for sid, stats in sorted_zones[:50]:  # cap at 50 zones
+            for sid, stats in sorted_zones[:50]:
                 total_us = stats["total"] / 1e3
                 min_us = stats["min"] / 1e3
                 max_us = stats["max"] / 1e3
@@ -1833,33 +1767,35 @@ json.dumps(result)
                     f"total={total_us:>10.2f}  "
                     f"min={min_us:>8.2f}  "
                     f"max={max_us:>8.2f}  "
-                    f"avg={avg_us:>8.2f}"
+                    f"avg={avg_us:>8.2f}  "
+                    f"name={stats.get('name', '')}"
                 )
             if len(zones) > 50:
                 lines.append(f"    ... and {len(zones) - 50} more zones (see JSON below)")
             lines.append("")
 
-        # Append full JSON for programmatic access
         lines.append("  Full JSON:")
         lines.append(json.dumps(result, indent=2))
         return "\n".join(lines)
 
     @staticmethod
-    def _format_diff_result(result: Dict[str, Any], item_type: str) -> str:
+    def _format_diff_result(result: Dict[str, Any]) -> str:
         """Format diff profile result as a readable string."""
-        prefix = result["prefix"]
+        zone_pattern = result["zone_pattern"]
         zone_count = result["zone_count"]
         zones = result["zones"]
+        reload_info = result.get("reload")
 
         lines = [
-            f"Diff profile result for {item_type} '{prefix}':",
+            f"Diff profile result for zone pattern {zone_pattern!r}:",
             f"  Zones compared: {zone_count}",
-            "",
         ]
+        if reload_info:
+            lines.append(f"  Reload: {reload_info['tool']}({reload_info['name']!r})")
+        lines.append("")
 
         if zone_count:
             lines.append("  Zone delta (count_diff, total_diff_us, total_pct, avg_before_us, avg_after_us):")
-            # Sort by absolute total percentage change
             sorted_zones = sorted(
                 zones.items(),
                 key=lambda kv: abs(kv[1].get("total_pct", 0)),
@@ -1869,12 +1805,13 @@ json.dumps(result)
                 total_diff_us = stats["total_diff"] / 1e3
                 avg_b_us = stats["avg_before"] / 1e3
                 avg_a_us = stats["avg_after"] / 1e3
-                direction = "↑" if stats["total_diff"] > 0 else "↓" if stats["total_diff"] < 0 else "→"
+                direction = "up" if stats["total_diff"] > 0 else "down" if stats["total_diff"] < 0 else "flat"
                 lines.append(
                     f"    [{sid}] {direction} count={stats['count_diff']:>+6}  "
                     f"total_diff={total_diff_us:>10.2f}  "
                     f"pct={stats['total_pct']:>+7.1f}%  "
-                    f"avg={avg_b_us:>8.2f} → {avg_a_us:>8.2f}"
+                    f"avg={avg_b_us:>8.2f} -> {avg_a_us:>8.2f}  "
+                    f"name={stats.get('name', '')}"
                 )
             if len(zones) > 50:
                 lines.append(f"    ... and {len(zones) - 50} more zones (see JSON below)")
@@ -1897,7 +1834,7 @@ def create_bridge_server() -> Any:
     server = fastmcp.FastMCP(name = "Beyond All Reason + Tracy profiling MCP server",
     instructions = """
     This server exposes tools for the game Beyond All Reason (BAR) on the Recoil Engine (SpringRTS) for developing and profiling BAR LuaUI widgets and LuaRules gadgets, with deep integration to Tracy for performance insights.
-    Tracy profiling should be done by adding zones in the Lua code with names that start with the widget/gadget name, e.g. tracy.ZoneBeginN("MyWidget:Update") / tracy.ZoneEnd()
+    Tracy profiling should be done by adding searchable zones in the Lua code, e.g. tracy.ZoneBeginN("MyWidget:Update") / tracy.ZoneEnd(), then calling profile_zone_pattern with a regex such as "^MyWidget:".
     Ensure all return paths are covered with tracy.ZoneEnd(). 
     Example:
     '''lua 
@@ -1968,14 +1905,10 @@ BRIDGE_TOOL_NAMES = {
     "bridge_status",
     "bridge_reconnect",
     "bar_call_tool",
-    "tracy_call_tool",
     "bar_refresh_tools",
-    "tracy_refresh_tools",
     "bridge_dynamic_tools",
-    "profile_widget",
-    "profile_gadget",
-    "profile_widget_diff",
-    "profile_gadget_diff",
+    "profile_zone_pattern",
+    "profile_zone_pattern_diff",
 }
 
 
@@ -2627,36 +2560,11 @@ class TracyBackendSupervisor:
         return False
 
     def _install_dynamic_tools(self) -> None:
-        if not self.registry:
-            return
-        discovered_names: Set[str] = set()
-        for tool_def in self.registry.tools:
-            raw_name = tool_def["name"]
-            tool_name = f"tracy_{raw_name}"
-            if tool_name in BRIDGE_TOOL_NAMES:
-                logger.warning("Skipping Tracy tool '%s' because it conflicts with a bridge tool", tool_name)
-                continue
-            discovered_names.add(tool_name)
-            tool_desc = tool_def.get("description", "")
-            input_schema = tool_def.get("inputSchema", {})
-            func = self._make_tool_handler(raw_name, tool_name, tool_desc, input_schema if isinstance(input_schema, dict) else {})
-            _install_or_replace_tool(self._server, tool_name, tool_desc, func)
-        for old_name in self._installed_tools - discovered_names:
+        for old_name in list(self._installed_tools):
             _remove_tool(self._server, old_name)
-        if discovered_names != self._installed_tools:
-            self._installed_tools = discovered_names
-            self._notifier.notify("tracy", sorted(discovered_names))
-
-    def _make_tool_handler(self, raw_name: str, tool_name: str, tool_desc: str, input_schema: Dict[str, Any]):
-        def handler(**kwargs) -> str:
-            result = self.call_tool(raw_name, _compact_tool_args(kwargs), timeout=120.0)
-            return _mcp_result_to_text(result)
-
-        handler.__name__ = tool_name
-        handler.__doc__ = tool_desc
-        handler.__signature__ = _signature_from_input_schema(input_schema)
-        handler.__annotations__ = {"return": str}
-        return handler
+        if self._installed_tools:
+            self._installed_tools = set()
+            self._notifier.notify("tracy", [])
 
     def _monitor_loop(self) -> None:
         while not self._stop_event.is_set():
@@ -2703,7 +2611,8 @@ def _bridge_status_payload(bar_backend: BarBackendSupervisor, tracy_backend: Tra
             "instance_id": tracy["instance_id"],
             "target": tracy["engine_target"],
         },
-        "profile_tools_available": bar["state"] == "ready" and tracy["mcp_state"] == "ready" and tracy["engine_state"] == "ready",
+        "profile_tools_available": tracy["mcp_state"] == "ready" and tracy["engine_state"] == "ready",
+        "profile_reload_available": bar["state"] == "ready" and tracy["mcp_state"] == "ready" and tracy["engine_state"] == "ready",
         "tool_notification_generation": notifier.generation,
         "tool_notifications": notifier.status(),
         "config": {
@@ -2719,24 +2628,26 @@ def _run_profile_with_retry(
     bar_backend: BarBackendSupervisor,
     tracy_backend: TracyBackendSupervisor,
     notifier: ToolListNotifier,
-    name: str,
+    zone_pattern: str,
     duration: float,
-    reload_tool: str,
+    reload_kind: str = "",
+    reload_name: str = "",
     diff: bool = False,
 ) -> str:
+    reload_name = (reload_name or "").strip()
+    reload_tool = _reload_tool_from_kind(reload_kind, reload_name)
     last_exc: Optional[Exception] = None
     for attempt in range(2):
         try:
-            bar_backend.ensure_ready()
+            if reload_tool:
+                bar_backend.ensure_ready()
             instance_id = tracy_backend.ensure_engine_ready()
             if not tracy_backend.client:
                 raise TracyConnectionError("Tracy client is unavailable after reconnect.")
             collector = ProfileCollector(bar_backend.registry, tracy_backend.client, instance_id)
             if diff:
-                return collector.profile_diff(name, duration, reload_tool=reload_tool)
-            if reload_tool == "gadget_reload":
-                return collector.profile_gadget(name, duration)
-            return collector.profile_widget(name, duration)
+                return collector.profile_diff(zone_pattern, duration, reload_tool=reload_tool, reload_name=reload_name or None)
+            return collector.profile_zone_pattern(zone_pattern, duration, reload_tool=reload_tool, reload_name=reload_name or None)
         except BarConnectionError as exc:
             last_exc = exc
             bar_backend.mark_offline(str(exc))
@@ -2744,10 +2655,24 @@ def _run_profile_with_retry(
             last_exc = exc
             tracy_backend.mark_engine_offline(str(exc))
         if attempt == 0:
-            logger.info("Retrying profile '%s' after backend reconnect", name)
+            logger.info("Retrying profile pattern %r after backend reconnect", zone_pattern)
             continue
     status = _bridge_status_payload(bar_backend, tracy_backend, notifier)
     raise RuntimeError(f"Profile failed after reconnect: {last_exc}\n\nBridge status:\n{json.dumps(status, indent=2)}")
+
+
+def _reload_tool_from_kind(reload_kind: str = "", reload_name: str = "") -> Optional[str]:
+    kind = (reload_kind or "").strip().lower()
+    name = (reload_name or "").strip()
+    if kind in {"", "none", "no", "off", "skip", "false"}:
+        if name:
+            raise ValueError("reload_name was provided but reload_kind is empty; use 'widget' or 'gadget'.")
+        return None
+    if kind in {"widget", "widgets", "luaui"}:
+        return "widget_reload"
+    if kind in {"gadget", "gadgets", "luarules"}:
+        return "gadget_reload"
+    raise ValueError("reload_kind must be one of: '', 'none', 'widget', or 'gadget'.")
 
 
 def register_stable_bridge_tools(server: Any, bar_backend: BarBackendSupervisor, tracy_backend: TracyBackendSupervisor, notifier: ToolListNotifier) -> None:
@@ -2755,12 +2680,12 @@ def register_stable_bridge_tools(server: Any, bar_backend: BarBackendSupervisor,
     def bridge_status() -> str:
         return json.dumps(_bridge_status_payload(bar_backend, tracy_backend, notifier), indent=2)
 
-    @server.tool(description="List currently installed dynamic convenience tools discovered from BAR and Tracy.")
+    @server.tool(description="List currently installed dynamic BAR convenience tools.")
     def bridge_dynamic_tools() -> str:
         status = _bridge_status_payload(bar_backend, tracy_backend, notifier)
         dynamic = {
             "bar": status["bar"]["tool_names"],
-            "tracy": [f"tracy_{name}" for name in status["tracy_mcp"]["tool_names"]],
+            "tracy": [],
             "notification_generation": status["tool_notification_generation"],
         }
         return json.dumps(dynamic, indent=2)
@@ -2794,36 +2719,36 @@ def register_stable_bridge_tools(server: Any, bar_backend: BarBackendSupervisor,
     def bar_call_tool(name: str, arguments: dict = None, timeout: float = 120.0) -> str:
         return bar_backend.call_tool(name, _parse_tool_arguments(arguments), timeout=timeout)
 
-    @server.tool(description="Call any discovered Tracy MCP tool by name. Arguments may be an object or JSON object string.")
-    def tracy_call_tool(name: str, arguments: dict = None, timeout: float = 120.0) -> str:
-        result = tracy_backend.call_tool(name, _parse_tool_arguments(arguments), timeout=timeout)
-        return _mcp_result_to_text(result)
-
     @server.tool(description="Reconnect BAR if needed, refresh BAR tools, and update BAR convenience wrappers.")
     def bar_refresh_tools() -> str:
         names = bar_backend.refresh_tools()
         return f"BAR tools refreshed ({len(names)}): {', '.join(names)}"
 
-    @server.tool(description="Reconnect Tracy MCP if needed, refresh Tracy tools, and update Tracy convenience wrappers.")
-    def tracy_refresh_tools() -> str:
-        names = tracy_backend.refresh_tools()
-        return f"Tracy tools refreshed ({len(names)}): {', '.join(names)}"
+    @server.tool(description="Profile Tracy zones matching a Python regex. Optionally reload a widget or gadget first with reload_kind='widget' or 'gadget' and reload_name.")
+    def profile_zone_pattern(zone_pattern: str, duration: float = 5.0, reload_kind: str = "", reload_name: str = "") -> str:
+        return _run_profile_with_retry(
+            bar_backend,
+            tracy_backend,
+            notifier,
+            zone_pattern,
+            duration,
+            reload_kind=reload_kind,
+            reload_name=reload_name,
+            diff=False,
+        )
 
-    @server.tool(description="Profile a LuaUI widget: reconnect backends as needed, reload it, wait, then collect Tracy zone stats.")
-    def profile_widget(name: str, duration: float = 5.0) -> str:
-        return _run_profile_with_retry(bar_backend, tracy_backend, notifier, name, duration, "widget_reload", diff=False)
-
-    @server.tool(description="Profile a LuaRules gadget: reconnect backends as needed, reload it, wait, then collect Tracy zone stats.")
-    def profile_gadget(name: str, duration: float = 5.0) -> str:
-        return _run_profile_with_retry(bar_backend, tracy_backend, notifier, name, duration, "gadget_reload", diff=False)
-
-    @server.tool(description="Run two profiling passes on a widget with reconnects as needed and return the delta.")
-    def profile_widget_diff(name: str, duration: float = 5.0) -> str:
-        return _run_profile_with_retry(bar_backend, tracy_backend, notifier, name, duration, "widget_reload", diff=True)
-
-    @server.tool(description="Run two profiling passes on a gadget with reconnects as needed and return the delta.")
-    def profile_gadget_diff(name: str, duration: float = 5.0) -> str:
-        return _run_profile_with_retry(bar_backend, tracy_backend, notifier, name, duration, "gadget_reload", diff=True)
+    @server.tool(description="Run two profiling passes for Tracy zones matching a Python regex and return the pass-to-pass delta. Optionally reload a widget or gadget before each pass.")
+    def profile_zone_pattern_diff(zone_pattern: str, duration: float = 5.0, reload_kind: str = "", reload_name: str = "") -> str:
+        return _run_profile_with_retry(
+            bar_backend,
+            tracy_backend,
+            notifier,
+            zone_pattern,
+            duration,
+            reload_kind=reload_kind,
+            reload_name=reload_name,
+            diff=True,
+        )
 
 
 
