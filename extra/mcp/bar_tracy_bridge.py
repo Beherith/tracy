@@ -109,6 +109,10 @@ class BarConnectionError(Exception):
     """Raised when the bridge cannot connect to BAR MCP."""
 
 
+class BarToolExecutionError(Exception):
+    """Raised when BAR MCP returns an MCP tool execution error."""
+
+
 class BarTcpClient:
     """Persistent TCP client for BAR MCP's raw-TCP JSON-RPC 2.0 protocol.
 
@@ -529,7 +533,7 @@ class BarTcpClient:
         """Call a BAR MCP tool via `tools/call` and return the result.
 
         Returns the raw result dict from BAR (contains 'content' and 'isError').
-        Raises BarConnectionError if the tool returned isError=true.
+        Raises BarToolExecutionError if the tool returned isError=true.
 
         Default timeout is 120s because the Lua server processes requests in
         widget:Update() which runs at game framerate — if the game is slow or
@@ -551,7 +555,7 @@ class BarTcpClient:
         result = response.get("result", {})
         if result.get("isError"):
             text = self._extract_text(result)
-            raise BarConnectionError(
+            raise BarToolExecutionError(
                 f"BAR MCP tool '{tool_name}' returned error: {text} — "
                 f"check game console for details."
             )
@@ -564,7 +568,7 @@ class BarTcpClient:
             # We call the 'ping' tool we just added to dbg_bar_mcp.lua
             result = self.call_tool("ping", timeout=timeout)
             return True
-        except BarConnectionError as exc:
+        except (BarConnectionError, BarToolExecutionError) as exc:
             logger.warning("BAR MCP heartbeat failed: %s", exc)
             return False
 
@@ -2361,6 +2365,8 @@ class BarBackendSupervisor:
                 self.refresh_tools()
             try:
                 return self.registry.call_tool(name, arguments or {}, timeout=timeout)
+            except BarToolExecutionError:
+                raise
             except BarConnectionError as exc:
                 last_exc = exc
                 self.mark_offline(str(exc))

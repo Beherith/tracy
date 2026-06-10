@@ -10,6 +10,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from bar_tracy_bridge import (
     BarBackendSupervisor,
+    BarToolExecutionError,
     ToolListNotifier,
     TracyBackendSupervisor,
     _enable_dynamic_tool_notifications,
@@ -41,6 +42,8 @@ class FakeBarServer:
     def __init__(self, port, tool_names):
         self.port = port
         self.tool_names = list(tool_names)
+        self.call_counts = {}
+        self.tool_errors = {}
         self._stop = threading.Event()
         self._sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self._sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -116,6 +119,10 @@ class FakeBarServer:
             args = params.get("arguments", {})
             if name not in self.tool_names:
                 return {"jsonrpc": "2.0", "id": msg["id"], "error": {"code": -32601, "message": "unknown"}}
+            self.call_counts[name] = self.call_counts.get(name, 0) + 1
+            if name in self.tool_errors:
+                result = {"content": [{"type": "text", "text": self.tool_errors[name]}], "isError": True}
+                return {"jsonrpc": "2.0", "id": msg["id"], "result": result}
             text = "pong" if name == "ping" else args.get("text", name)
             result = {"content": [{"type": "text", "text": text}], "isError": False}
             return {"jsonrpc": "2.0", "id": msg["id"], "result": result}
@@ -284,6 +291,25 @@ class BridgeResilienceTests(unittest.TestCase):
         self.assertIn("new_tool", names)
         self.assertIn("new_tool", server._tool_manager._tools)
         self.assertNotIn("echo", server._tool_manager._tools)
+
+    def test_bar_tool_execution_error_is_not_retried_or_reconnected(self):
+        server = FakeFastMCP()
+        notifier = ToolListNotifier()
+        port = free_port()
+        fake = FakeBarServer(port, ["ping", "gadget_reload"])
+        fake.tool_errors["gadget_reload"] = "infolog found Lua error"
+        fake.start()
+        self.addCleanup(fake.stop)
+
+        bar = BarBackendSupervisor(server, notifier, port=port)
+        bar.ensure_ready()
+
+        with self.assertRaises(BarToolExecutionError):
+            bar.call_tool("gadget_reload", {"name": "AA Targeting Priority"})
+
+        self.assertEqual(fake.call_counts.get("gadget_reload"), 1)
+        self.assertEqual(bar.state, "ready")
+        self.assertTrue(bar.client.connected)
 
     def test_tracy_supervisor_recovers_and_updates_tool_wrappers(self):
         try:
