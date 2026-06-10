@@ -200,9 +200,9 @@ local function debugPreview(value)
 	return s
 end
 
-local function isQuietTool(toolName)
-	return toolName == "ping"
-end
+local QUIET_TOOL_NAMES = {
+	ping = true,
+}
 
 --------------------------------------------------------------------------------
 -- Value serializer (used by lua_eval return values)
@@ -442,7 +442,7 @@ local function onToolsCall(client, msg)
 	end
 
 	-- Debug: log tool call with params
-	if debugMode and not isQuietTool(toolName) then
+	if debugMode and not QUIET_TOOL_NAMES[toolName] then
 		local okArgs, argsStr = pcall(Json.encode, args)
 		spEcho("[BARMCP] >>> tool '" .. toolName .. "' args=" .. tostring(okArgs and argsStr or args))
 	end
@@ -458,7 +458,7 @@ local function onToolsCall(client, msg)
 		elseif toolName == "gadget_disable"  then fwd = "mcp_gadget_disable:" .. reqId .. ":" .. tostring(args.name or "")
 		elseif toolName == "gadget_reload"   then fwd = "mcp_gadget_reload:"  .. reqId .. ":" .. tostring(args.name or "")
 		end
-		if debugMode then
+		if debugMode and not QUIET_TOOL_NAMES[toolName] then
 			spEcho("[BARMCP] >>> async forward: " .. fwd)
 		end
 		Spring.SendLuaRulesMsg(fwd)
@@ -468,13 +468,13 @@ local function onToolsCall(client, msg)
 	-- Sync tools: call handler directly
 	local ok, result = pcall(tool.handler, args)
 	if not ok then
-		if debugMode then
+		if debugMode and not QUIET_TOOL_NAMES[toolName] then
 			spEcho("[BARMCP] <<< tool '" .. toolName .. "' ERROR: " .. tostring(result))
 		end
 		sendResult(client, msg.id, mcpErr(tostring(result)))
 		return
 	end
-	if debugMode and not isQuietTool(toolName) then
+	if debugMode and not QUIET_TOOL_NAMES[toolName] then
 		spEcho("[BARMCP] <<< tool '" .. toolName .. "' result=" .. debugPreview(result))
 	end
 	sendResult(client, msg.id, mcpOk(result))
