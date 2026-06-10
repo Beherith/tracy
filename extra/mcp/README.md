@@ -53,6 +53,12 @@ The bridge advertises MCP `tools.listChanged` support and sends
 set. If a client does not honor those notifications, use the stable generic
 tools instead.
 
+BAR-side mutating tools such as `widget_reload`, `gadget_reload`, and
+`spring_command` now lay down an infolog marker before execution and return a
+structured JSON text report containing the command result, the infolog lines
+captured after the marker, and any matching engine `Error...` lines found in
+that delta.
+
 ## Restart Behavior
 
 The bridge starts even if BAR or Tracy are offline. Backend supervisors run in
@@ -98,6 +104,11 @@ Defaults can be overridden:
 - `BRIDGE_LOG_LEVEL` default `INFO`
 
 Logs go to stderr and `bar_tracy_bridge.log`.
+
+For BAR's in-engine infolog checks, the widget reads `infolog.txt` directly via
+`VFS.LoadFile("infolog.txt")`. If the engine does not expose that file through
+VFS for some reason, the monitored BAR tools still run, but their JSON report
+marks the infolog check as unavailable.
 
 ## Profiling Convention
 
