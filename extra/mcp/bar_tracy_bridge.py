@@ -78,6 +78,28 @@ TRACY_ENGINE_ALIAS = os.environ.get("TRACY_ENGINE_ALIAS", "live_engine")
 _TRACY_MCP_SCRIPT = os.path.join(_HERE, "tracy_mcp.py")
 _TRACY_MCP_PID_FILE = os.path.join(_HERE, "tracy_mcp.pid")
 
+
+def _env_flag(name: str, default: bool = False) -> bool:
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    return value.strip().lower() not in {"0", "false", "no", "off", ""}
+
+
+def _env_float(name: str, default: float) -> float:
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    try:
+        return float(value)
+    except ValueError:
+        logger.warning("Invalid float for %s=%r; using %.2f", name, value, default)
+        return default
+
+
+BRIDGE_STARTUP_BAR_PROBE = _env_flag("BRIDGE_STARTUP_BAR_PROBE", True)
+BRIDGE_STARTUP_BAR_TIMEOUT = _env_float("BRIDGE_STARTUP_BAR_TIMEOUT", 2.0)
+
 # ---------------------------------------------------------------------------
 # Phase 1.1 — BarTcpClient
 # ---------------------------------------------------------------------------
@@ -104,11 +126,13 @@ class BarTcpClient:
         port: int = BAR_PORT,
         reconnect_max: int = 5,
         reconnect_base: float = 1.0,
+        connect_timeout: float = 5.0,
     ):
         self._host = host
         self._port = port
         self._reconnect_max = reconnect_max
         self._reconnect_base = reconnect_base
+        self._connect_timeout = connect_timeout
 
         self._sock: Optional[socket.socket] = None
         self._buffer = ""
@@ -141,7 +165,7 @@ class BarTcpClient:
         """
         self._notification_callbacks.append(callback)
 
-    def connect(self) -> None:
+    def connect(self, timeout: Optional[float] = None) -> None:
         """Establish a TCP connection to BAR MCP.
 
         Raises BarConnectionError if the connection cannot be established.
@@ -149,9 +173,11 @@ class BarTcpClient:
         addr = f"{self._host}:{self._port}"
         logger.info("Connecting to BAR MCP on %s …", addr)
 
+        connect_timeout = self._connect_timeout if timeout is None else timeout
+
         try:
             self._sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            self._sock.settimeout(5.0)
+            self._sock.settimeout(connect_timeout)
             self._sock.connect((self._host, self._port))
             self._sock.settimeout(1.0)  # non-blocking reads for reader loop
             self._buffer = ""
@@ -1993,16 +2019,61 @@ def _mcp_result_to_data(result: Any) -> Any:
 
 
 class ToolListNotifier:
-    """Central best-effort hook for dynamic tool-list changes."""
+    """Central best-effort hook for dynamic MCP tool-list changes."""
 
     def __init__(self) -> None:
         self._lock = threading.Lock()
         self._generation = 0
+        self._sessions: Dict[int, Dict[str, Any]] = {}
+        self._notification_thread_active = False
 
     @property
     def generation(self) -> int:
         with self._lock:
             return self._generation
+
+    def status(self) -> Dict[str, Any]:
+        with self._lock:
+            pending = sum(1 for session in self._sessions.values() if session["seen_generation"] < self._generation)
+            return {
+                "generation": self._generation,
+                "captured_sessions": len(self._sessions),
+                "pending_sessions": pending,
+            }
+
+    def capture_request_context(self, request_context: Any, mark_generation_seen: bool = False) -> bool:
+        """Remember the current MCP session so background threads can notify it."""
+        session = getattr(request_context, "session", None)
+        if session is None or not hasattr(session, "send_tool_list_changed"):
+            return False
+        try:
+            from anyio.lowlevel import current_token
+
+            token = current_token()
+        except Exception as exc:
+            logger.debug("Could not capture MCP event loop token for tool-list notifications: %s", exc)
+            return False
+
+        session_id = id(session)
+        schedule = False
+        with self._lock:
+            previous = self._sessions.get(session_id)
+            if mark_generation_seen:
+                seen_generation = self._generation
+            elif previous is not None:
+                seen_generation = previous["seen_generation"]
+            else:
+                seen_generation = 0
+            self._sessions[session_id] = {
+                "session": session,
+                "token": token,
+                "seen_generation": seen_generation,
+            }
+            if not mark_generation_seen and self._generation > seen_generation:
+                schedule = True
+        if schedule:
+            self._schedule_notifications()
+        return True
 
     def notify(self, source: str, tool_names: List[str]) -> None:
         with self._lock:
@@ -2014,6 +2085,74 @@ class ToolListNotifier:
             generation,
             ", ".join(tool_names),
         )
+        self._schedule_notifications()
+
+    def _schedule_notifications(self) -> None:
+        with self._lock:
+            if self._notification_thread_active:
+                return
+            self._notification_thread_active = True
+        thread = threading.Thread(
+            target=self._notification_loop,
+            daemon=True,
+            name="tool-list-change-notifier",
+        )
+        thread.start()
+
+    def _notification_loop(self) -> None:
+        try:
+            while True:
+                did_work = self._send_pending_notifications()
+                with self._lock:
+                    pending = any(
+                        session["seen_generation"] < self._generation for session in self._sessions.values()
+                    )
+                    if not pending or not did_work:
+                        self._notification_thread_active = False
+                        return
+        except Exception:
+            logger.exception("Unexpected failure in tool-list notification loop")
+            with self._lock:
+                self._notification_thread_active = False
+
+    def _send_pending_notifications(self) -> bool:
+        with self._lock:
+            generation = self._generation
+            targets = [
+                (session_id, session["session"], session["token"], session["seen_generation"])
+                for session_id, session in self._sessions.items()
+                if session["seen_generation"] < generation
+            ]
+        if not targets:
+            logger.debug("Tool list changed, but no MCP client session has been captured yet")
+            return False
+
+        sent_ids: List[int] = []
+        dead_ids: List[int] = []
+        for session_id, session, token, _seen_generation in targets:
+            try:
+                from anyio import from_thread
+
+                from_thread.run(session.send_tool_list_changed, token=token)
+                sent_ids.append(session_id)
+            except Exception as exc:
+                logger.debug("Dropping MCP session %s after tool-list notification failed: %s", session_id, exc)
+                dead_ids.append(session_id)
+
+        with self._lock:
+            for session_id in sent_ids:
+                session = self._sessions.get(session_id)
+                if session is not None:
+                    session["seen_generation"] = max(session["seen_generation"], generation)
+            for session_id in dead_ids:
+                self._sessions.pop(session_id, None)
+        if sent_ids:
+            logger.info(
+                "Sent tools/list_changed notification for generation %d to %d MCP client session(s)",
+                generation,
+                len(sent_ids),
+            )
+        return bool(sent_ids or dead_ids)
 
 
 def _remove_tool(server: Any, name: str) -> bool:
@@ -2028,6 +2167,90 @@ def _remove_tool(server: Any, name: str) -> bool:
 def _install_or_replace_tool(server: Any, name: str, description: str, func: Callable[..., Any]) -> None:
     _remove_tool(server, name)
     server.tool(name=name, description=description)(func)
+
+
+def _capture_current_mcp_session(server: Any, notifier: ToolListNotifier, mark_generation_seen: bool) -> None:
+    mcp_server = getattr(server, "_mcp_server", None)
+    if mcp_server is None:
+        return
+    try:
+        request_context = mcp_server.request_context
+    except LookupError:
+        return
+    except Exception as exc:
+        logger.debug("Could not read current MCP request context: %s", exc)
+        return
+    notifier.capture_request_context(request_context, mark_generation_seen=mark_generation_seen)
+
+
+def _enable_dynamic_tool_notifications(server: Any, notifier: ToolListNotifier) -> None:
+    """Advertise and emit MCP tool-list change notifications when SDK hooks exist."""
+    mcp_server = getattr(server, "_mcp_server", None)
+    if mcp_server is None:
+        logger.debug("FastMCP low-level server is unavailable; tool-list notifications disabled")
+        return
+
+    _enable_tool_list_changed_capability(mcp_server)
+    _wrap_tool_request_handlers(server, notifier, mcp_server)
+
+
+def _enable_tool_list_changed_capability(mcp_server: Any) -> None:
+    original = getattr(mcp_server, "create_initialization_options", None)
+    if not callable(original) or getattr(original, "_bar_tracy_tools_changed_enabled", False):
+        return
+    try:
+        from mcp.server.lowlevel import NotificationOptions
+    except Exception as exc:
+        logger.debug("Could not import MCP NotificationOptions; listChanged capability disabled: %s", exc)
+        return
+
+    def create_initialization_options(
+        notification_options: Any = None,
+        experimental_capabilities: Optional[Dict[str, Dict[str, Any]]] = None,
+    ) -> Any:
+        if notification_options is None:
+            notification_options = NotificationOptions(tools_changed=True)
+        elif hasattr(notification_options, "tools_changed"):
+            notification_options.tools_changed = True
+        return original(
+            notification_options=notification_options,
+            experimental_capabilities=experimental_capabilities,
+        )
+
+    create_initialization_options._bar_tracy_tools_changed_enabled = True  # type: ignore[attr-defined]
+    setattr(mcp_server, "create_initialization_options", create_initialization_options)
+
+
+def _wrap_tool_request_handlers(server: Any, notifier: ToolListNotifier, mcp_server: Any) -> None:
+    handlers = getattr(mcp_server, "request_handlers", None)
+    if not isinstance(handlers, dict):
+        logger.debug("FastMCP request handlers are unavailable; tool-list notifications may be delayed")
+        return
+    try:
+        import mcp.types as mcp_types
+    except Exception as exc:
+        logger.debug("Could not import MCP request types; tool-list session capture disabled: %s", exc)
+        return
+
+    list_handler = handlers.get(mcp_types.ListToolsRequest)
+    if callable(list_handler) and not getattr(list_handler, "_bar_tracy_session_capture", False):
+
+        async def captured_list_tools(req: Any, _original: Callable[..., Any] = list_handler) -> Any:
+            _capture_current_mcp_session(server, notifier, mark_generation_seen=True)
+            return await _original(req)
+
+        captured_list_tools._bar_tracy_session_capture = True  # type: ignore[attr-defined]
+        handlers[mcp_types.ListToolsRequest] = captured_list_tools
+
+    call_handler = handlers.get(mcp_types.CallToolRequest)
+    if callable(call_handler) and not getattr(call_handler, "_bar_tracy_session_capture", False):
+
+        async def captured_call_tool(req: Any, _original: Callable[..., Any] = call_handler) -> Any:
+            _capture_current_mcp_session(server, notifier, mark_generation_seen=False)
+            return await _original(req)
+
+        captured_call_tool._bar_tracy_session_capture = True  # type: ignore[attr-defined]
+        handlers[mcp_types.CallToolRequest] = captured_call_tool
 
 
 class BarBackendSupervisor:
@@ -2089,7 +2312,7 @@ class BarBackendSupervisor:
             self.generation += 1
         self.client.disconnect()
 
-    def ensure_ready(self, timeout: float = 5.0) -> None:
+    def ensure_ready(self, timeout: float = 5.0, connect_timeout: Optional[float] = None) -> None:
         with self._lock:
             if self.state == "ready" and self.client.connected:
                 return
@@ -2101,7 +2324,7 @@ class BarBackendSupervisor:
                     return
             self._set_state("connecting")
             self.client.disconnect()
-            self.client.connect()
+            self.client.connect(timeout=connect_timeout)
             self._initialize_client()
             self.registry.discover()
             self._install_dynamic_tools()
@@ -2476,6 +2699,7 @@ def _bridge_status_payload(bar_backend: BarBackendSupervisor, tracy_backend: Tra
         },
         "profile_tools_available": bar["state"] == "ready" and tracy["mcp_state"] == "ready" and tracy["engine_state"] == "ready",
         "tool_notification_generation": notifier.generation,
+        "tool_notifications": notifier.status(),
         "config": {
             "bar_target": f"{BAR_HOST}:{BAR_PORT}",
             "tracy_mcp_target": f"{TRACY_HOST}:{TRACY_PORT}",
@@ -2622,6 +2846,7 @@ def main() -> None:
 
     server = create_bridge_server()
     notifier = ToolListNotifier()
+    _enable_dynamic_tool_notifications(server, notifier)
     bar_backend = BarBackendSupervisor(server, notifier, BAR_HOST, BAR_PORT)
     tracy_backend = TracyBackendSupervisor(
         server,
@@ -2634,6 +2859,17 @@ def main() -> None:
     )
 
     register_stable_bridge_tools(server, bar_backend, tracy_backend, notifier)
+
+    if BRIDGE_STARTUP_BAR_PROBE:
+        try:
+            logger.info("Probing BAR before MCP startup so discovered tools appear in the first tools/list")
+            bar_backend.ensure_ready(
+                timeout=BRIDGE_STARTUP_BAR_TIMEOUT,
+                connect_timeout=BRIDGE_STARTUP_BAR_TIMEOUT,
+            )
+        except Exception as exc:
+            logger.info("BAR startup probe did not complete; background reconnect will continue: %s", exc)
+
     bar_backend.start()
     tracy_backend.start()
 

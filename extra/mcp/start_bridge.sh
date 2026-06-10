@@ -7,6 +7,8 @@
 #   ./start_bridge.sh --sse --port 47381
 #
 # Environment:
+#   BRIDGE_STARTUP_BAR_PROBE - Probe BAR before MCP startup (default: 1)
+#   BRIDGE_STARTUP_BAR_TIMEOUT - Startup BAR probe timeout seconds (default: 2.0)
 #   BAR_MCP_HOST      — BAR MCP hostname     (default: 127.0.0.1)
 #   BAR_MCP_PORT      — BAR MCP port         (default: 23452)
 #   TRACY_MCP_HOST    — Tracy MCP hostname   (default: 127.0.0.1)
@@ -39,6 +41,8 @@ export TRACY_MCP_PORT="${TRACY_MCP_PORT:-47380}"
 export TRACY_ENGINE_HOST="${TRACY_ENGINE_HOST:-127.0.0.1}"
 export TRACY_ENGINE_PORT="${TRACY_ENGINE_PORT:-8086}"
 export TRACY_ENGINE_ALIAS="${TRACY_ENGINE_ALIAS:-live_engine}"
+export BRIDGE_STARTUP_BAR_PROBE="${BRIDGE_STARTUP_BAR_PROBE:-1}"
+export BRIDGE_STARTUP_BAR_TIMEOUT="${BRIDGE_STARTUP_BAR_TIMEOUT:-2.0}"
 export BRIDGE_LOG_LEVEL="${BRIDGE_LOG_LEVEL:-INFO}"
 
 # Machine-local overrides (not committed). Create start_bridge.local.sh next to
@@ -77,6 +81,7 @@ echo "[BRIDGE] Starting BAR + Tracy Bridge"
 echo "[BRIDGE] BAR target:   $BAR_MCP_HOST:$BAR_MCP_PORT"
 echo "[BRIDGE] Tracy target: $TRACY_MCP_HOST:$TRACY_MCP_PORT"
 echo "[BRIDGE] Engine Tracy: $TRACY_ENGINE_HOST:$TRACY_ENGINE_PORT as $TRACY_ENGINE_ALIAS"
+echo "[BRIDGE] Startup BAR probe: $BRIDGE_STARTUP_BAR_PROBE timeout ${BRIDGE_STARTUP_BAR_TIMEOUT}s"
 echo "[BRIDGE] Transport:    $TRANSPORT"
 echo "[BRIDGE] Auto-start Tracy MCP: handled inside bridge"
 echo "[BRIDGE] Command: $PYTHON $BRIDGE_SCRIPT ${BRIDGE_ARGS[*]:-}"

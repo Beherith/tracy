@@ -200,6 +200,10 @@ local function debugPreview(value)
 	return s
 end
 
+local function isQuietTool(toolName)
+	return toolName == "ping"
+end
+
 --------------------------------------------------------------------------------
 -- Value serializer (used by lua_eval return values)
 --------------------------------------------------------------------------------
@@ -438,7 +442,7 @@ local function onToolsCall(client, msg)
 	end
 
 	-- Debug: log tool call with params
-	if debugMode then
+	if debugMode and not isQuietTool(toolName) then
 		local okArgs, argsStr = pcall(Json.encode, args)
 		spEcho("[BARMCP] >>> tool '" .. toolName .. "' args=" .. tostring(okArgs and argsStr or args))
 	end
@@ -470,7 +474,7 @@ local function onToolsCall(client, msg)
 		sendResult(client, msg.id, mcpErr(tostring(result)))
 		return
 	end
-	if debugMode then
+	if debugMode and not isQuietTool(toolName) then
 		spEcho("[BARMCP] <<< tool '" .. toolName .. "' result=" .. debugPreview(result))
 	end
 	sendResult(client, msg.id, mcpOk(result))

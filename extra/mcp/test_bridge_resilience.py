@@ -5,12 +5,15 @@ import threading
 import time
 import unittest
 import urllib.parse
+from types import SimpleNamespace
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from bar_tracy_bridge import (
     BarBackendSupervisor,
     ToolListNotifier,
     TracyBackendSupervisor,
+    _enable_dynamic_tool_notifications,
+    create_bridge_server,
 )
 
 
@@ -224,6 +227,42 @@ class FakeTracyServer(ThreadingHTTPServer):
 
 
 class BridgeResilienceTests(unittest.TestCase):
+    def test_fastmcp_advertises_tool_list_changed(self):
+        server = create_bridge_server()
+        notifier = ToolListNotifier()
+        _enable_dynamic_tool_notifications(server, notifier)
+
+        options = server._mcp_server.create_initialization_options()
+        self.assertIsNotNone(options.capabilities.tools)
+        self.assertTrue(options.capabilities.tools.listChanged)
+
+    def test_tool_list_notifier_sends_list_changed_to_captured_session(self):
+        try:
+            import anyio
+        except ImportError:
+            self.skipTest("anyio is not installed")
+
+        class FakeSession:
+            def __init__(self):
+                self.count = 0
+                self.sent = threading.Event()
+
+            async def send_tool_list_changed(self):
+                self.count += 1
+                self.sent.set()
+
+        async def run_case():
+            notifier = ToolListNotifier()
+            session = FakeSession()
+            notifier.capture_request_context(SimpleNamespace(session=session), mark_generation_seen=True)
+            await anyio.to_thread.run_sync(lambda: notifier.notify("bar", ["ping"]))
+            ok = await anyio.to_thread.run_sync(lambda: session.sent.wait(2.0))
+            self.assertTrue(ok)
+            self.assertEqual(session.count, 1)
+            self.assertEqual(notifier.status()["pending_sessions"], 0)
+
+        anyio.run(run_case)
+
     def test_bar_supervisor_recovers_and_updates_tool_wrappers(self):
         server = FakeFastMCP()
         notifier = ToolListNotifier()

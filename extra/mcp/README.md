@@ -48,13 +48,20 @@ offline:
 
 Dynamic convenience wrappers are also installed for discovered BAR tools and
 Tracy tools. Tracy tools are prefixed with `tracy_`, for example `tracy_eval`.
-If a client does not notice dynamic tool-list changes, use the stable generic
+The bridge advertises MCP `tools.listChanged` support and sends
+`notifications/tools/list_changed` when rediscovery changes the dynamic wrapper
+set. If a client does not honor those notifications, use the stable generic
 tools instead.
 
 ## Restart Behavior
 
 The bridge starts even if BAR or Tracy are offline. Backend supervisors run in
 the background with jittered backoff.
+
+Before accepting MCP client requests, the bridge also performs a short BAR
+startup probe. If BAR is already running, discovered BAR tools are installed in
+time for the client's first `tools/list`. If the probe fails, startup continues
+and the background supervisor keeps reconnecting.
 
 When BAR reconnects:
 
@@ -86,6 +93,8 @@ Defaults can be overridden:
 - `TRACY_ENGINE_HOST` default `127.0.0.1`
 - `TRACY_ENGINE_PORT` default `8086`
 - `TRACY_ENGINE_ALIAS` default `live_engine`
+- `BRIDGE_STARTUP_BAR_PROBE` default `true`
+- `BRIDGE_STARTUP_BAR_TIMEOUT` default `2.0`
 - `BRIDGE_LOG_LEVEL` default `INFO`
 
 Logs go to stderr and `bar_tracy_bridge.log`.
