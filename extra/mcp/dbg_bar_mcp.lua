@@ -31,16 +31,12 @@ end
 --   lua_eval          – run Lua in the unsynced widget environment, return value(s)
 --   lua_eval_synced   – run Lua in the synced gadget environment (async; needs cheats)
 --   widget_list       – list all known LuaUI widgets and their active state
---   widget_enable     – load a widget by name
---   widget_disable    – unload a widget by name
 --   widget_reload     – disable then re-enable a widget by name
 --   spring_command    – send a Spring/Recoil console command (e.g. "reloadshaders")
 --   vfs_read          – read a VFS file (capped at 512 KB)
 --   vfs_list          – list VFS directory contents with a glob pattern
 --   game_info         – current frame, map/mod name, player, cheat/dev flags
 --   gadget_list       – list all known LuaRules gadgets (async via gadget companion)
---   gadget_enable     – load a gadget by name (async)
---   gadget_disable    – unload a gadget by name (async)
 --   gadget_reload     – disable then re-enable a gadget (async)
 --
 -- Async tools forward a message to the synced gadget companion via
@@ -90,6 +86,7 @@ local MCP_HOST    = "127.0.0.1"
 local MCP_VERSION = "2025-11-25"
 local VFS_CAP     = 512 * 1024 -- 512 KB read cap
 local MAX_CLIENT_BUFFER = 1024 * 1024 -- Drop clients that send >1 MB without a newline
+local MAX_CONSOLE_CACHE_LINES = 4096
 local INFOLOG_MARKER_PREFIX = "[BARMCP_INFOLOG_MARKER]"
 local INFOLOG_ERROR_PATTERN = "^%[t=[%d%.:]*%]%[f=[%-%d]*%] Error.*"
 
@@ -106,6 +103,7 @@ local selectSet = {}  -- all sockets for socket.select
 -- pending async tool calls awaiting gadget response: reqId -> {client, jsonId}
 local pending   = {}
 local nextReqId = 0
+local consoleLineCache = {}
 
 local function newReqId()
 	nextReqId = nextReqId + 1
@@ -238,6 +236,55 @@ local function findLastPlain(text, needle)
 	end
 end
 
+local function cacheConsoleLine(line, priority)
+	consoleLineCache[#consoleLineCache + 1] = {
+		frame = Spring.GetGameFrame(),
+		line = tostring(line),
+		priority = priority,
+	}
+	while #consoleLineCache > MAX_CONSOLE_CACHE_LINES do
+		table.remove(consoleLineCache, 1)
+	end
+end
+
+local function lineIsInfologError(line)
+	return line:match(INFOLOG_ERROR_PATTERN) ~= nil or line:match("^Error[:%s].*") ~= nil
+end
+
+local function fillInfologReportFromLines(report, lines, source)
+	local errorLines = {}
+	for _, line in ipairs(lines) do
+		if lineIsInfologError(line) then
+			errorLines[#errorLines + 1] = line
+		end
+	end
+	report.checked = true
+	report.source = source
+	report.lines = lines
+	report.errorLines = errorLines
+	report.lineCount = #lines
+	report.errorCount = #errorLines
+	return report
+end
+
+local function collectConsoleDelta(probe, report)
+	local markerIndex = nil
+	for i = #consoleLineCache, 1, -1 do
+		if consoleLineCache[i].line:find(probe.marker, 1, true) then
+			markerIndex = i
+			break
+		end
+	end
+	if not markerIndex then
+		return nil, "marker was not found in cached console lines"
+	end
+	local lines = {}
+	for i = markerIndex + 1, #consoleLineCache do
+		lines[#lines + 1] = consoleLineCache[i].line
+	end
+	return fillInfologReportFromLines(report, lines, "console")
+end
+
 local function readInfologSnapshot()
 	local ok, content = pcall(function()
 		return VFS.LoadFile("infolog.txt")
@@ -267,6 +314,7 @@ local function beginInfologProbe(toolName, requestId)
 		(os and os.clock and os.clock()) or 0
 	)
 	probe.marker = marker
+	cacheConsoleLine(marker, "marker")
 	spEcho(marker)
 	return probe
 end
@@ -289,14 +337,18 @@ local function collectInfologDelta(probe)
 		report.reason = probe.reason or "infolog marker is unavailable"
 		return report
 	end
+	local consoleReport, consoleMiss = collectConsoleDelta(probe, report)
+	if consoleReport then
+		return consoleReport
+	end
 	local snapshot, readErr = readInfologSnapshot()
 	if not snapshot then
-		report.reason = readErr
+		report.reason = tostring(consoleMiss) .. "; VFS fallback failed: " .. tostring(readErr)
 		return report
 	end
 	local markerIdx = findLastPlain(snapshot, probe.marker)
 	if not markerIdx then
-		report.reason = "marker was not found in infolog"
+		report.reason = tostring(consoleMiss) .. "; marker was not found in VFS infolog"
 		return report
 	end
 	local after = snapshot:sub(markerIdx + #probe.marker)
@@ -306,18 +358,7 @@ local function collectInfologDelta(probe)
 		after = after:sub(2)
 	end
 	local lines = splitLines(after)
-	local errorLines = {}
-	for _, line in ipairs(lines) do
-		if line:match(INFOLOG_ERROR_PATTERN) then
-			errorLines[#errorLines + 1] = line
-		end
-	end
-	report.checked = true
-	report.lines = lines
-	report.errorLines = errorLines
-	report.lineCount = #lines
-	report.errorCount = #errorLines
-	return report
+	return fillInfologReportFromLines(report, lines, "vfs")
 end
 
 local function buildInfologToolPayload(toolName, commandResult, infolog)
@@ -459,6 +500,7 @@ local TOOLS = {
 		description = "Execute Lua code in the unsynced LuaUI widget environment. Returns the serialized return value(s).",
 		inputSchema = {type="object", properties={code={type="string", description="Lua code to execute"}}, required={"code"}},
 		handler     = tool_lua_eval,
+		infologCheck = true,
 	},
 	{
 		name        = "lua_eval_synced",
@@ -471,20 +513,6 @@ local TOOLS = {
 		description = "List all known LuaUI widgets and whether they are currently active.",
 		inputSchema = {type="object", properties={}},
 		handler     = tool_widget_list,
-	},
-	{
-		name        = "widget_enable",
-		description = "Enable (load) a LuaUI widget by name.",
-		inputSchema = {type="object", properties={name={type="string", description="Widget name"}}, required={"name"}},
-		handler     = tool_widget_enable,
-		infologCheck = true,
-	},
-	{
-		name        = "widget_disable",
-		description = "Disable (unload) a LuaUI widget by name.",
-		inputSchema = {type="object", properties={name={type="string", description="Widget name"}}, required={"name"}},
-		handler     = tool_widget_disable,
-		infologCheck = true,
 	},
 	{
 		name        = "widget_reload",
@@ -523,20 +551,6 @@ local TOOLS = {
 		description = "List all known LuaRules gadgets and whether they are active. Requires Gadget Auto Reloader. Async.",
 		inputSchema = {type="object", properties={}},
 		async       = true,
-	},
-	{
-		name        = "gadget_enable",
-		description = "Enable (load) a LuaRules gadget by name. Async.",
-		inputSchema = {type="object", properties={name={type="string", description="Gadget name"}}, required={"name"}},
-		async       = true,
-		infologCheck = true,
-	},
-	{
-		name        = "gadget_disable",
-		description = "Disable (unload) a LuaRules gadget by name. Async.",
-		inputSchema = {type="object", properties={name={type="string", description="Gadget name"}}, required={"name"}},
-		async       = true,
-		infologCheck = true,
 	},
 	{
 		name        = "gadget_reload",
@@ -602,8 +616,6 @@ local function onToolsCall(client, msg)
 		local fwd
 		if     toolName == "lua_eval_synced" then fwd = "mcp_exec:"           .. reqId .. ":" .. tostring(args.code or "")
 		elseif toolName == "gadget_list"     then fwd = "mcp_gadget_list:"    .. reqId
-		elseif toolName == "gadget_enable"   then fwd = "mcp_gadget_enable:"  .. reqId .. ":" .. tostring(args.name or "")
-		elseif toolName == "gadget_disable"  then fwd = "mcp_gadget_disable:" .. reqId .. ":" .. tostring(args.name or "")
 		elseif toolName == "gadget_reload"   then fwd = "mcp_gadget_reload:"  .. reqId .. ":" .. tostring(args.name or "")
 		end
 		if debugMode and not QUIET_TOOL_NAMES[toolName] then
@@ -749,6 +761,14 @@ function widget:Update(dt)
 				removeClient(sock)
 				spEcho("[BARMCP] Client disconnected. Remaining: " .. #clients)
 			end
+		end
+	end
+end
+
+function widget:AddConsoleLine(lines, priority)
+	for _, line in ipairs(splitLines(lines)) do
+		if not line:find(INFOLOG_MARKER_PREFIX, 1, true) then
+			cacheConsoleLine(line, priority)
 		end
 	end
 end

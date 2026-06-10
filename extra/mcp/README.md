@@ -53,11 +53,11 @@ The bridge advertises MCP `tools.listChanged` support and sends
 set. If a client does not honor those notifications, use the stable generic
 tools instead.
 
-BAR-side mutating tools such as `widget_reload`, `gadget_reload`, and
-`spring_command` now lay down an infolog marker before execution and return a
-structured JSON text report containing the command result, the infolog lines
-captured after the marker, and any matching engine `Error...` lines found in
-that delta.
+BAR-side tools that can surface Lua/runtime issues, such as `lua_eval`,
+`widget_reload`, `gadget_reload`, and `spring_command`, now lay down an infolog
+marker before execution and return a structured JSON text report containing the
+command result, console/infolog lines captured after the marker, and any
+matching engine `Error...` lines found in that delta.
 
 ## Restart Behavior
 
@@ -105,10 +105,10 @@ Defaults can be overridden:
 
 Logs go to stderr and `bar_tracy_bridge.log`.
 
-For BAR's in-engine infolog checks, the widget reads `infolog.txt` directly via
-`VFS.LoadFile("infolog.txt")`. If the engine does not expose that file through
-VFS for some reason, the monitored BAR tools still run, but their JSON report
-marks the infolog check as unavailable.
+For BAR's in-engine infolog checks, the widget primarily captures lines through
+`widget:AddConsoleLine`, which avoids waiting for `infolog.txt` to flush to
+disk. If the marker is not present in the cached console lines, it falls back to
+`VFS.LoadFile("infolog.txt")`.
 
 ## Profiling Convention
 

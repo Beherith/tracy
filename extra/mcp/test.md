@@ -65,15 +65,6 @@ The bar_tracy_bridge.py logs here: `N:\github\tracy\extra\mcp\bar_tracy_bridge.l
 **Purpose**: List all known LuaUI widgets and their active state.
 - [ ] **Success Case**: Call the tool and verify it returns a JSON list of widgets.
 
-### 13. `widget_enable`
-**Purpose**: Enable (load) a LuaUI widget by name.
-- [ ] **Success Case**: Provide a valid widget name. Verify it returns a success message.
-- [ ] **Invalid Name**: Provide a non-existent widget name. Verify it returns an error.
-
-### 14. `widget_disable`
-**Purpose**: Disable (unload) a LuaUI widget by name.
-- [ ] **Success Case**: Provide a valid widget name. Verify it returns a success message.
-
 ### 15. `widget_reload`
 **Purpose**: Reload (disable then re-enable) a LuaUI widget by name.
 - [ ] **Success Case**: Provide a valid widget name. Verify it returns a success message.
@@ -99,14 +90,6 @@ The bar_tracy_bridge.py logs here: `N:\github\tracy\extra\mcp\bar_tracy_bridge.l
 ### 20. `gadget_list`
 **Purpose**: List all known LuaRules gadgets and whether they are active.
 - [ ] **Success Case**: Call the tool and verify it returns a JSON list of gadgets.
-
-### 21. `gadget_enable`
-**Purpose**: Enable (load) a LuaRules gadget by name.
-- [ ] **Success Case**: Provide a valid gadget name. Verify it returns a success message.
-
-### 22. `gadget_disable`
-**Purpose**: Disable (unload) a LuaRules gadget by name.
-- [ ] **Success Case**: Provide a valid gadget name. Verify it returns a success message.
 
 ### 23. `gadget_reload`
 **Purpose**: Reload (disable then re-enable) a LuaRules gadget by name.
