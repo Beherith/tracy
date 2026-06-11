@@ -3,14 +3,16 @@
 This directory contains a restart-resilient MCP bridge for agentic BAR Lua
 development and Tracy profiling.
 
-The bridge exposes a stable MCP server to the AI client, then supervises two
-flaky local backends underneath it:
+The bridge exposes a stable MCP server to the AI client, then supervises local
+backends underneath it:
 
 - BAR MCP over raw TCP: `127.0.0.1:23452`, implemented by `dbg_bar_mcp.lua`
-- Tracy MCP over SSE/HTTP: `127.0.0.1:47380`, implemented by `tracy_mcp.py`
+- Tracy profiling in-process: lazy `TracyServerBindings` import plus direct
+  live-engine/eval helpers folded into `bar_tracy_bridge.py`
 
-`tracy_mcp.py` is treated as an upstream backend. The resilience and dynamic
-tool behavior live in `bar_tracy_bridge.py`.
+`tracy_mcp.py` is no longer started as an upstream backend by the bridge. Tracy
+binding import failures and live-engine connection failures are reported in
+bridge status without preventing the MCP bridge from starting.
 
 ## VS Code MCP Config
 
@@ -29,23 +31,27 @@ tool behavior live in `bar_tracy_bridge.py`.
 
 ## Stable Bridge Tools
 
-These tools are registered even when BAR, Tracy MCP, or the game engine are
+These tools are registered even when BAR, Tracy bindings, or the game engine are
 offline:
 
-- `bridge_status` - JSON health/status for BAR, Tracy MCP, Tracy engine, dynamic
-  tool count, generations, and current config.
-- `bridge_dynamic_tools` - currently installed BAR convenience wrappers.
-- `bridge_reconnect` - force BAR, Tracy MCP, and/or Tracy engine reconnect.
+- `bridge_status` - JSON health/status for BAR, local Tracy backend, Tracy
+  engine, dynamic tool count, generations, and current config.
+- `bridge_dynamic_tools` - currently installed BAR convenience wrappers and
+  Tracy profile tools.
+- `bridge_reconnect` - force BAR, local Tracy backend, and/or Tracy engine reconnect.
 - `bar_call_tool` - call any BAR tool by name with JSON arguments.
 - `bar_refresh_tools` - rediscover BAR tools and replace dynamic wrappers.
-- `profile_zone_pattern` - lazy reconnect, optionally reload a widget/gadget,
-  wait, then collect Tracy zones matching a Python regex.
-- `profile_zone_pattern_diff` - two lazy profiling passes for the same zone
+- `profile_zone_pattern` - appears only after the bridge has found and
+  connected to a live Tracy engine; optionally reloads a widget/gadget, waits,
+  then collects Tracy zones matching a Python regex.
+- `profile_zone_pattern_diff` - appears only after the bridge has found and
+  connected to a live Tracy engine; runs two profiling passes for the same zone
   pattern and an optional reload target.
 
-Dynamic convenience wrappers are installed for discovered BAR tools only. Tracy
-MCP tools are still discovered for internal bridge operations, but raw Tracy
-tools are not exposed to the MCP client.
+Dynamic convenience wrappers are installed for discovered BAR tools. Local
+Tracy tools are discovered for internal bridge operations, but raw Tracy tools
+are not exposed to the MCP client. The two profile tools are dynamically
+installed only while a live Tracy engine connection is ready.
 The bridge advertises MCP `tools.listChanged` support and sends
 `notifications/tools/list_changed` when rediscovery changes the dynamic wrapper
 set. If a client does not honor those notifications, use the stable generic
@@ -76,16 +82,19 @@ When BAR reconnects:
 
 When Tracy reconnects:
 
-1. start or connect to `tracy_mcp.py`
-2. open SSE session
-3. MCP initialize
-4. `tools/list`
-5. keep discovered Tracy tools internal to the bridge
-6. live engine connection is established lazily when a profiling tool needs it
+1. create an in-process Tracy client
+2. lazily import `TracyServerBindings`
+3. discover the folded local Tracy tools
+4. scan `TRACY_ENGINE_PORT_RANGE`, default `8086-8095`
+5. try the configured `TRACY_ENGINE_PORT` first, then discovered ports
+6. install `profile_zone_pattern` and `profile_zone_pattern_diff` only after a
+   live engine connection succeeds
 
-Profiling tools are always present. They reconnect Tracy MCP and the live
-engine instance at call time; when `reload_kind` is set, they also reconnect BAR
-before calling `widget_reload` or `gadget_reload`.
+Profiling tools are hidden from MCP `tools/list` while no live Tracy engine is
+connected. The background supervisor keeps scanning, and sends
+`tools.listChanged` when those profile tools are added or removed. When
+`reload_kind` is set, a profile call also reconnects BAR before calling
+`widget_reload` or `gadget_reload`.
 
 ## Environment
 
@@ -93,10 +102,9 @@ Defaults can be overridden:
 
 - `BAR_MCP_HOST` default `127.0.0.1`
 - `BAR_MCP_PORT` default `23452`
-- `TRACY_MCP_HOST` default `127.0.0.1`
-- `TRACY_MCP_PORT` default `47380`
 - `TRACY_ENGINE_HOST` default `127.0.0.1`
 - `TRACY_ENGINE_PORT` default `8086`
+- `TRACY_ENGINE_PORT_RANGE` default `8086-8095`
 - `TRACY_ENGINE_ALIAS` default `live_engine`
 - `BRIDGE_STARTUP_BAR_PROBE` default `true`
 - `BRIDGE_STARTUP_BAR_TIMEOUT` default `2.0`
@@ -139,5 +147,5 @@ python -B -m unittest test_bridge_resilience.py
 lua -e "assert(loadfile('dbg_bar_mcp.lua')); print('dbg_bar_mcp.lua syntax ok')"
 ```
 
-The unit tests use fake BAR TCP and Tracy SSE backends to verify dynamic tool
-rediscovery and Tracy restart recovery without touching the real engine.
+The unit tests use fake BAR TCP and local Tracy clients to verify dynamic tool
+rediscovery and Tracy recovery without touching the real engine.

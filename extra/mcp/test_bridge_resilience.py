@@ -15,6 +15,7 @@ from bar_tracy_bridge import (
     TracyBackendSupervisor,
     _enable_dynamic_tool_notifications,
     create_bridge_server,
+    register_stable_bridge_tools,
 )
 
 
@@ -202,7 +203,7 @@ class FakeTracyHandler(BaseHTTPRequestHandler):
             params = msg.get("params", {})
             name = params.get("name")
             if name == "live_connect":
-                self.state.instances = [{"id": "live_engine", "path": None, "mtime": None, "live": True}]
+                self.state.instances = [{"id": "live_engine", "live": True}]
                 text = "Connected to live instance as 'live_engine'."
             elif name == "list_instances":
                 text = json.dumps(self.state.instances)
@@ -231,6 +232,54 @@ class FakeTracyServer(ThreadingHTTPServer):
         self.shutdown()
         self.server_close()
         self._thread.join(timeout=1.0)
+
+
+class FakeLocalTracyClient:
+    def __init__(self, state):
+        self.state = state
+        self.connected = False
+        self.bindings_available = True
+        self.bindings_error = None
+
+    def connect(self):
+        self.connected = True
+
+    def disconnect(self):
+        self.connected = False
+
+    def discover_tools(self, timeout=15.0):
+        return [
+            {
+                "name": name,
+                "description": f"{name} tool",
+                "inputSchema": {"type": "object", "properties": {}},
+            }
+            for name in self.state.tool_names
+        ]
+
+    def call_tool(self, tool_name, arguments=None, timeout=None):
+        arguments = arguments or {}
+        if tool_name == "discover_instances":
+            discovered = getattr(self.state, "discovered", None)
+            if discovered is None:
+                discovered = [{"port": 8086, "address": "127.0.0.1"}]
+            return {"content": [{"type": "text", "text": json.dumps(discovered)}], "structuredContent": {"result": discovered}, "isError": False}
+        if tool_name == "live_connect":
+            port = int(arguments.get("port", 8086))
+            self.state.live_connect_attempts = getattr(self.state, "live_connect_attempts", [])
+            self.state.live_connect_attempts.append(port)
+            live_ports = getattr(self.state, "live_ports", None)
+            if live_ports is not None and port not in live_ports:
+                return {"content": [{"type": "text", "text": f"Failed to connect: no Tracy server on {port}"}], "isError": True}
+            self.state.instances = [{"id": "live_engine", "live": True}]
+            text = "Connected to live instance as 'live_engine'."
+        elif tool_name == "list_instances":
+            text = json.dumps(self.state.instances)
+        elif tool_name == "eval":
+            text = "{}"
+        else:
+            text = tool_name or ""
+        return {"content": [{"type": "text", "text": text}], "isError": False}
 
 
 class BridgeResilienceTests(unittest.TestCase):
@@ -312,32 +361,56 @@ class BridgeResilienceTests(unittest.TestCase):
         self.assertTrue(bar.client.connected)
 
     def test_tracy_supervisor_recovers_without_exposing_raw_tool_wrappers(self):
-        try:
-            import httpx  # noqa: F401
-        except ImportError:
-            self.skipTest("httpx is not installed")
-
         server = FakeFastMCP()
         notifier = ToolListNotifier()
-        port = free_port()
-        tracy_server = FakeTracyServer(port, ["list_instances", "live_connect", "eval"])
-        tracy_server.start()
-        self.addCleanup(tracy_server.stop)
+        state = FakeTracyState(["list_instances", "live_connect", "eval"])
 
-        tracy = TracyBackendSupervisor(server, notifier, port=port)
+        tracy = TracyBackendSupervisor(
+            server,
+            notifier,
+            client_factory=lambda _host, _port: FakeLocalTracyClient(state),
+        )
         tracy.ensure_mcp_ready()
         self.assertNotIn("tracy_eval", server._tool_manager._tools)
         self.assertEqual(tracy.ensure_engine_ready(), "live_engine")
 
-        tracy_server.stop()
-        time.sleep(0.1)
-        replacement = FakeTracyServer(port, ["list_instances", "live_connect", "eval", "new_stat"])
-        replacement.start()
-        self.addCleanup(replacement.stop)
+        state.tool_names = ["list_instances", "live_connect", "eval", "new_stat"]
         tracy.mark_mcp_offline("test restart")
         names = tracy.refresh_tools()
         self.assertIn("new_stat", names)
         self.assertNotIn("tracy_new_stat", server._tool_manager._tools)
+
+    def test_tracy_scans_ports_and_exposes_profile_tools_only_when_engine_ready(self):
+        server = FakeFastMCP()
+        notifier = ToolListNotifier()
+        state = FakeTracyState(["list_instances", "discover_instances", "live_connect", "eval"])
+        state.discovered = [{"port": 8087, "address": "127.0.0.1"}]
+        state.live_ports = {8087}
+
+        tracy = TracyBackendSupervisor(
+            server,
+            notifier,
+            engine_port=8086,
+            engine_port_range="8086-8088",
+            client_factory=lambda _host, _port: FakeLocalTracyClient(state),
+        )
+        bar = SimpleNamespace()
+        register_stable_bridge_tools(server, bar, tracy, notifier)
+
+        self.assertNotIn("profile_zone_pattern", server._tool_manager._tools)
+        tracy.ensure_mcp_ready()
+        self.assertNotIn("profile_zone_pattern", server._tool_manager._tools)
+
+        self.assertEqual(tracy.ensure_engine_ready(), "live_engine")
+        self.assertEqual(state.live_connect_attempts, [8086, 8087])
+        self.assertIn("profile_zone_pattern", server._tool_manager._tools)
+        self.assertIn("profile_zone_pattern_diff", server._tool_manager._tools)
+
+        status = tracy.status()
+        self.assertEqual(status["engine_target"], "127.0.0.1:8087")
+
+        tracy.mark_engine_offline("test disconnect")
+        self.assertNotIn("profile_zone_pattern", server._tool_manager._tools)
 
 
 if __name__ == "__main__":

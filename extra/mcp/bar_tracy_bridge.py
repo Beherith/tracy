@@ -2,9 +2,9 @@
 """
 BAR + Tracy Bridge MCP Server
 
-Sits between an AI client (Copilot, Claude, etc.) and two MCP servers:
+Sits between an AI client (Copilot, Claude, etc.) and local profiling backends:
   - BAR MCP (raw TCP JSON-RPC on 127.0.0.1:23452)
-  - Tracy MCP (SSE/HTTP on 127.0.0.1:47380)
+  - TracyServerBindings loaded in-process
 
 Exposes all BAR tools as standard MCP tools so any MCP client can use them
 without needing raw-TCP support.
@@ -24,25 +24,31 @@ Usage:
 Environment variables:
     BAR_MCP_HOST      - BAR MCP hostname  (default: 127.0.0.1)
     BAR_MCP_PORT      - BAR MCP port      (default: 23452)
-    TRACY_MCP_HOST    - Tracy MCP hostname (default: 127.0.0.1)
-    TRACY_MCP_PORT    - Tracy MCP port    (default: 47380)
+    TRACY_ENGINE_HOST - Tracy engine hostname (default: 127.0.0.1)
+    TRACY_ENGINE_PORT - Tracy engine port     (default: 8086)
     BRIDGE_LOG_LEVEL  - Log level         (default: INFO)
 """
 
 from __future__ import annotations
 
 import argparse
+import asyncio
+import builtins
+import concurrent.futures
 import inspect
+import io
 import json
 import logging
 import os
 import random
 import re
 import socket
-import subprocess
+import struct
 import sys
 import threading
 import time
+import uuid
+from contextlib import redirect_stdout
 from typing import Any, Callable, Dict, List, Optional, Set
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
@@ -74,9 +80,14 @@ TRACY_HOST = os.environ.get("TRACY_MCP_HOST", "127.0.0.1")
 TRACY_PORT = int(os.environ.get("TRACY_MCP_PORT", "47380"))
 TRACY_ENGINE_HOST = os.environ.get("TRACY_ENGINE_HOST", "127.0.0.1")
 TRACY_ENGINE_PORT = int(os.environ.get("TRACY_ENGINE_PORT", "8086"))
+TRACY_ENGINE_PORT_RANGE = os.environ.get("TRACY_ENGINE_PORT_RANGE", "8086-8095")
 TRACY_ENGINE_ALIAS = os.environ.get("TRACY_ENGINE_ALIAS", "live_engine")
-_TRACY_MCP_SCRIPT = os.path.join(_HERE, "tracy_mcp.py")
-_TRACY_MCP_PID_FILE = os.path.join(_HERE, "tracy_mcp.pid")
+_LLM_DIR = os.path.normpath(os.path.join(_HERE, "..", "..", "profiler", "src", "llm"))
+_PROMPT_PATH = os.path.join(_LLM_DIR, "system.prompt.md")
+_EVAL_GUIDE_PATH = os.path.join(_HERE, "eval_guide.md")
+_PROTOCOL_HPP = os.path.normpath(os.path.join(_HERE, "..", "..", "public", "common", "TracyProtocol.hpp"))
+_BROADCAST_PORT = 8086
+_PROGRAM_NAME_SIZE = 64
 
 
 def _env_flag(name: str, default: bool = False) -> bool:
@@ -673,533 +684,446 @@ def _preview_text(value: Any, max_chars: int = 4096) -> str:
 
 
 class TracyConnectionError(Exception):
-    """Raised when the bridge cannot connect to Tracy MCP."""
+    """Raised when the bridge cannot use the in-process Tracy backend."""
 
 
-class TracyHttpClient:
-    """Proper SSE client for Tracy MCP's FastMCP SSE transport.
+class Task:
+    def __init__(self, task_id: str, code: str):
+        self.id = task_id
+        self.code = code
+        self.status = "pending"
+        self.result = None
+        self.error = None
+        self.start_time = time.time()
+        self.end_time = None
 
-    MCP SSE transport model:
-    1. Client opens a persistent GET /sse stream.
-    2. Server sends an 'endpoint' event with the message POST URL.
-    3. Client POSTs JSON-RPC messages to that URL.
-    4. Server sends responses back on the SSE stream as 'result' events.
-    5. Responses are demultiplexed by JSON-RPC request ID.
 
-    This client maintains:
-    - A persistent SSE stream (background reader thread).
-    - Unique auto-incrementing request IDs.
-    - Response demultiplexing by ID (thread-safe, like BarTcpClient).
+class TracyInstance:
+    def __init__(self, name: str, worker: object | None = None):
+        self.name = name
+        self.worker = worker
+
+
+_tracy_instances: Dict[str, TracyInstance] = {}
+_tracy_tasks: Dict[str, Task] = {}
+_tracy_executor = concurrent.futures.ThreadPoolExecutor(max_workers=4)
+_tracy_bindings = None
+_tracy_bindings_error: Optional[str] = None
+_tracy_bindings_lock = threading.Lock()
+
+
+def _read_text(path: str) -> str:
+    try:
+        with open(path, encoding="utf-8") as f:
+            return f.read()
+    except Exception as exc:
+        return f"(unavailable: {exc})"
+
+
+def _read_bindings_protocol_version() -> Optional[int]:
+    try:
+        with open(_PROTOCOL_HPP, encoding="utf-8") as f:
+            for line in f:
+                match = re.search(r"constexpr\s+uint32_t\s+ProtocolVersion\s*=\s*(\d+)", line)
+                if match:
+                    return int(match.group(1))
+    except Exception:
+        pass
+    return None
+
+
+_OUR_PROTOCOL_VERSION = _read_bindings_protocol_version()
+
+
+def _parse_broadcast(data: bytes) -> Optional[Dict[str, Any]]:
+    if len(data) < 4:
+        return None
+
+    def _name(buf: bytes) -> str:
+        return buf[:_PROGRAM_NAME_SIZE].split(b"\0", 1)[0].decode("utf-8", "replace")
+
+    bv16 = struct.unpack_from("<H", data, 0)[0]
+    if bv16 == 3 and len(data) >= 21:
+        bv, lp, pv, pid, at = struct.unpack_from("<HHIQi", data, 0)
+        return {"broadcast_version": bv, "listen_port": lp, "protocol_version": pv, "pid": pid, "active_seconds": at, "program": _name(data[20:])}
+    if bv16 == 2 and len(data) >= 13:
+        bv, lp, pv, at = struct.unpack_from("<HHIi", data, 0)
+        return {"broadcast_version": bv, "listen_port": lp, "protocol_version": pv, "active_seconds": at, "program": _name(data[12:])}
+    bv32 = struct.unpack_from("<I", data, 0)[0]
+    if bv32 == 1 and len(data) >= 17:
+        bv, pv, lp, at = struct.unpack_from("<IIII", data, 0)
+        return {"broadcast_version": bv, "listen_port": lp, "protocol_version": pv, "active_seconds": at, "program": _name(data[16:])}
+    if bv32 == 0 and len(data) >= 13:
+        bv, pv, at = struct.unpack_from("<III", data, 0)
+        return {"broadcast_version": bv, "listen_port": None, "protocol_version": pv, "active_seconds": at, "program": _name(data[12:])}
+    return None
+
+
+async def _listen_tracy_broadcasts(timeout_s: float = 1.5) -> List[Dict[str, Any]]:
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    try:
+        sock.bind(("", _BROADCAST_PORT))
+    except OSError:
+        sock.close()
+        return []
+    sock.setblocking(False)
+    loop = asyncio.get_running_loop()
+    seen: Dict[Optional[int], Dict[str, Any]] = {}
+    deadline = loop.time() + timeout_s
+    try:
+        while loop.time() < deadline:
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                break
+            try:
+                data, _addr = await asyncio.wait_for(loop.sock_recvfrom(sock, 2048), timeout=remaining)
+            except (asyncio.TimeoutError, BlockingIOError):
+                break
+            parsed = _parse_broadcast(data)
+            if parsed:
+                seen.setdefault(parsed.get("listen_port"), parsed)
+    finally:
+        sock.close()
+    return list(seen.values())
+
+
+def _load_tracy_bindings() -> Any:
+    global _tracy_bindings, _tracy_bindings_error
+    with _tracy_bindings_lock:
+        if _tracy_bindings is not None:
+            return _tracy_bindings
+        errors: List[str] = []
+        try:
+            from tracy_client import TracyServerBindings as bindings
+
+            _tracy_bindings = bindings
+            _tracy_bindings_error = None
+            return _tracy_bindings
+        except BaseException as exc:
+            errors.append(f"from tracy_client import TracyServerBindings: {exc}")
+
+        build_path = os.path.normpath(os.path.join(_HERE, "../../build/python"))
+        if build_path not in sys.path:
+            sys.path.append(build_path)
+        try:
+            import TracyServerBindings as bindings
+
+            _tracy_bindings = bindings
+            _tracy_bindings_error = None
+            return _tracy_bindings
+        except BaseException as exc:
+            errors.append(f"import TracyServerBindings from {build_path}: {exc}")
+
+        _tracy_bindings_error = "; ".join(errors)
+        logger.warning("Tracy Server bindings are unavailable: %s", _tracy_bindings_error)
+        return None
+
+
+def _run_coroutine_sync(coro: Any) -> Any:
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        return asyncio.run(coro)
+
+    box: Dict[str, Any] = {}
+
+    def _runner() -> None:
+        try:
+            box["result"] = asyncio.run(coro)
+        except BaseException as exc:
+            box["error"] = exc
+
+    thread = threading.Thread(target=_runner, daemon=True, name="tracy-local-async")
+    thread.start()
+    thread.join()
+    if "error" in box:
+        raise box["error"]
+    return box.get("result")
+
+
+def _tracy_tool_result(value: Any, is_error: bool = False) -> Dict[str, Any]:
+    if isinstance(value, str):
+        text = value
+    elif isinstance(value, (dict, list)):
+        text = json.dumps(value)
+    else:
+        text = "" if value is None else str(value)
+    result: Dict[str, Any] = {"content": [{"type": "text", "text": text}], "isError": is_error}
+    if isinstance(value, (dict, list)):
+        result["structuredContent"] = {"result": value}
+    return result
+
+
+async def _tracy_list_instances() -> List[Dict[str, Any]]:
+    return [
+        {"id": name, "live": True}
+        for name, inst in _tracy_instances.items()
+    ]
+
+
+async def _tracy_discover_instances(port_range: str = "8086-8095") -> List[Dict[str, Any]]:
+    start_port, end_port = map(int, port_range.split("-"))
+    discovered: List[Dict[str, Any]] = []
+
+    async def check_port(port: int) -> None:
+        try:
+            _, writer = await asyncio.wait_for(asyncio.open_connection("127.0.0.1", port), timeout=0.1)
+            writer.close()
+            await writer.wait_closed()
+            discovered.append({"port": port, "address": "127.0.0.1"})
+        except (OSError, asyncio.TimeoutError, ConnectionRefusedError):
+            pass
+
+    await asyncio.gather(*(check_port(port) for port in range(start_port, end_port + 1)))
+    return discovered
+
+
+async def _tracy_live_connect(address: str = "127.0.0.1", port: int = 8086, alias: Optional[str] = None) -> str:
+    logger.info("live_connect called with address=%s, port=%s, alias=%s", address, port, alias)
+    bindings = _load_tracy_bindings()
+    if bindings is None:
+        return f"Error: Tracy Server bindings not found. {_tracy_bindings_error or ''}".strip()
+
+    broadcasts = await _listen_tracy_broadcasts(timeout_s=3.5)
+    match = next((b for b in broadcasts if b.get("listen_port") == port), None)
+    if match and _OUR_PROTOCOL_VERSION is not None and match["protocol_version"] != _OUR_PROTOCOL_VERSION:
+        return (
+            f"Protocol mismatch: target program '{match['program']}' announces Tracy protocol "
+            f"v{match['protocol_version']} on {address}:{port}, but these server bindings are "
+            f"built against v{_OUR_PROTOCOL_VERSION}. Rebuild the bindings or the target "
+            f"against a matching Tracy version."
+        )
+
+    try:
+        worker = bindings.Worker(address, port)
+    except BaseException as exc:
+        logger.error("Failed to construct Tracy worker for %s:%s: %s", address, port, exc)
+        return f"Failed to connect: {exc}"
+
+    deadline_s = 2.0
+    step_s = 0.1
+    elapsed = 0.0
+    while elapsed < deadline_s:
+        try:
+            if worker.is_connected():
+                break
+        except BaseException as exc:
+            try:
+                worker.shutdown()
+            except BaseException:
+                pass
+            return f"Failed to connect: worker connection check failed: {exc}"
+        await asyncio.sleep(step_s)
+        elapsed += step_s
+
+    try:
+        connected = worker.is_connected()
+    except BaseException:
+        connected = False
+    if not connected:
+        try:
+            worker.shutdown()
+        except BaseException:
+            pass
+        if broadcasts and not match:
+            seen = ", ".join(
+                f"'{b['program']}' on port {b.get('listen_port')} (protocol v{b['protocol_version']})"
+                for b in broadcasts
+            )
+            hint = f" Detected other Tracy broadcasts: {seen}."
+        elif not broadcasts:
+            hint = (
+                " No Tracy broadcasts were received on port 8086 in 3.5s. "
+                "The target may use TRACY_ON_DEMAND, a non-default broadcast port, or is not running."
+            )
+        else:
+            hint = ""
+        return (
+            f"Reached {address}:{port} but the Tracy handshake did not complete within "
+            f"{deadline_s:.1f}s.{hint} Common causes: version mismatch, TRACY_ON_DEMAND "
+            f"waiting for a profiler request, or another client already attached."
+        )
+
+    name = alias or f"live_{address}_{port}"
+    _tracy_instances[name] = TracyInstance(name, worker)
+    return (
+        f"Connected to live instance as '{name}'. Before your first eval, read resources "
+        f"tracy://prompt and tracy://eval-guide."
+    )
+
+
+async def _tracy_disconnect_instance(instance_id: str) -> str:
+    inst = _tracy_instances.pop(instance_id, None)
+    if inst is None:
+        return f"Instance '{instance_id}' not found."
+    worker = inst.worker
+    if worker is not None:
+        try:
+            worker.shutdown()
+        except BaseException:
+            pass
+    return f"Instance '{instance_id}' disconnected."
+
+
+def _execute_tracy_eval_sync(code: str, ctx: object) -> str:
+    bindings = _load_tracy_bindings()
+    global_vars = {
+        "__builtins__": builtins,
+        "ctx": ctx,
+        "tracy": bindings,
+        "instances": {name: inst.worker for name, inst in _tracy_instances.items()},
+    }
+    buf = io.StringIO()
+    with redirect_stdout(buf):
+        try:
+            result = eval(compile(code, "<eval>", "eval"), global_vars)
+        except SyntaxError:
+            exec(compile(code, "<exec>", "exec"), global_vars)
+            result = None
+    output = buf.getvalue()
+    if result is None:
+        return output or ""
+    return str(result)
+
+
+async def _execute_tracy_eval(code: str, ctx: object) -> str:
+    return await asyncio.get_running_loop().run_in_executor(_tracy_executor, _execute_tracy_eval_sync, code, ctx)
+
+
+def _run_tracy_task_sync(task: Task, worker: object) -> None:
+    task.status = "running"
+    try:
+        task.result = _execute_tracy_eval_sync(task.code, worker)
+        task.status = "completed"
+    except BaseException as exc:
+        task.error = str(exc)
+        task.status = "failed"
+    finally:
+        task.end_time = time.time()
+
+
+async def _tracy_eval(code: str, instance_id: str, async_mode: bool = False) -> Any:
+    if instance_id not in _tracy_instances:
+        return f"Error: Instance '{instance_id}' not found. Use list_instances to find valid IDs."
+    instance = _tracy_instances[instance_id]
+    if not instance.worker:
+        return f"Error: Instance '{instance_id}' has no worker."
+    if not async_mode:
+        return await _execute_tracy_eval(code, instance.worker)
+
+    task_id = str(uuid.uuid4())
+    task = Task(task_id, code)
+    _tracy_tasks[task_id] = task
+    asyncio.get_running_loop().run_in_executor(_tracy_executor, _run_tracy_task_sync, task, instance.worker)
+    return {"task_id": task_id, "status": "running"}
+
+
+async def _tracy_task(action: str, task_id: Optional[str] = None) -> Any:
+    if action == "list":
+        return [{"id": task.id, "status": task.status, "elapsed": time.time() - task.start_time} for task in _tracy_tasks.values()]
+    if not task_id or task_id not in _tracy_tasks:
+        return "Error: Task ID not found."
+    task = _tracy_tasks[task_id]
+    if action == "poll":
+        result: Dict[str, Any] = {"id": task.id, "status": task.status}
+        if task.status == "completed":
+            result["result"] = task.result
+        elif task.status == "failed":
+            result["error"] = task.error
+        return result
+    if action == "cancel":
+        if task.status == "running":
+            task.status = "cancelled"
+            return f"Task {task_id} marked as cancelled."
+        return f"Task {task_id} is not running."
+    return "Error: Unknown action."
+
+
+TRACY_LOCAL_TOOL_SCHEMAS: List[Dict[str, Any]] = [
+    {"name": "list_instances", "description": "List live Tracy engine connections.", "inputSchema": {"type": "object", "properties": {}}},
+    {"name": "discover_instances", "description": "Scan local ports for running Tracy-instrumented applications.", "inputSchema": {"type": "object", "properties": {"port_range": {"type": "string", "default": "8086-8095"}}}},
+    {"name": "live_connect", "description": "Connect to a live Tracy-instrumented application.", "inputSchema": {"type": "object", "properties": {"address": {"type": "string", "default": "127.0.0.1"}, "port": {"type": "integer", "default": 8086}, "alias": {"type": "string"}}, "required": []}},
+    {"name": "disconnect_instance", "description": "Disconnect a live Tracy engine instance.", "inputSchema": {"type": "object", "properties": {"instance_id": {"type": "string"}}, "required": ["instance_id"]}},
+    {"name": "eval", "description": "Execute Python code against a Tracy Worker bound as ctx.", "inputSchema": {"type": "object", "properties": {"code": {"type": "string"}, "instance_id": {"type": "string"}, "async_mode": {"type": "boolean", "default": False}}, "required": ["code", "instance_id"]}},
+    {"name": "task", "description": "Manage background Tracy eval tasks.", "inputSchema": {"type": "object", "properties": {"action": {"type": "string"}, "task_id": {"type": "string"}}, "required": ["action"]}},
+]
+
+
+class TracyLocalClient:
+    """In-process Tracy tool client folded from tracy_mcp.py.
+
+    The name is retained for the bridge code/tests that only need a client with
+    connected, discover_tools, call_tool, and disconnect methods.
     """
 
-    def __init__(
-        self,
-        host: str = TRACY_HOST,
-        port: int = TRACY_PORT,
-        timeout: float = 30.0,
-    ):
+    def __init__(self, host: str = TRACY_HOST, port: int = TRACY_PORT, timeout: float = 30.0):
         self._host = host
         self._port = port
         self._timeout = timeout
-        self._base_url = f"http://{host}:{port}"
         self._connected = False
-
-        # Connection lock to prevent concurrent reconnection attempts
-        self._conn_lock = threading.Lock()
-
-        # SSE session state
-        self._message_url: Optional[str] = None  # POST endpoint from 'endpoint' event
-        self._endpoint_event = threading.Event()  # signaled when endpoint received
-        self._request_id = 0
-
-        # Persistent SSE stream
-        self._sse_stream = None  # httpx.Response (streaming)
-        self._sse_context = None  # httpx._GeneratorContextManager (for cleanup)
-        self._sse_reader_running = False
-        self._sse_reader_thread: Optional[threading.Thread] = None
-
-        # Response demultiplexing: request_id -> threading.Event
-        self._lock = threading.Lock()
-        self._pending: Dict[int, threading.Event] = {}
-        self._pending_results: Dict[int, Any] = {}
-
-        # Notification callbacks (for handling server->client notifications)
-        self._notification_callbacks: List[callable] = []
-
-    def on_notification(self, callback: callable) -> None:
-        """Register a callback for incoming JSON-RPC notifications.
-
-        Args:
-            callback: Function that receives (method: str, params: dict)
-        """
-        self._notification_callbacks.append(callback)
 
     @property
     def connected(self) -> bool:
-        return self._connected and self._message_url is not None
+        return self._connected
 
     @property
-    def base_url(self) -> str:
-        return self._base_url
+    def bindings_available(self) -> bool:
+        return _load_tracy_bindings() is not None
+
+    @property
+    def bindings_error(self) -> Optional[str]:
+        if _tracy_bindings is None and _tracy_bindings_error is None:
+            _load_tracy_bindings()
+        return _tracy_bindings_error
 
     def connect(self) -> None:
-        """Establish SSE session with Tracy MCP.
-
-        Opens /sse, reads the 'endpoint' event to get the message URL,
-        then starts the background SSE reader thread.
-
-        Raises TracyConnectionError if the handshake fails.
-        """
-        addr = f"{self._host}:{self._port}"
-        logger.info("Connecting to Tracy MCP on %s ...", addr)
-
-        try:
-            import httpx
-        except ImportError:
-            raise TracyConnectionError(
-                "httpx is required for Tracy MCP communication. "
-                "Install with: pip install httpx"
-            )
-
-        # Import httpx once and cache it
-        self._httpx = httpx
-        self._endpoint_event.clear()
-        self._message_url = None
-
-        # Open persistent SSE stream (httpx.stream returns a context manager)
-        try:
-            self._sse_context = self._httpx.stream(
-                "GET",
-                f"{self._base_url}/sse",
-                timeout=self._timeout,
-                headers={"Accept": "text/event-stream"},
-            )
-            # Enter the context manager to get the actual Response object
-            self._sse_stream = self._sse_context.__enter__()
-        except TracyConnectionError:
-            raise
-        except Exception as exc:
-            raise TracyConnectionError(
-                f"Cannot connect to Tracy MCP on {addr} - "
-                f"is Tracy MCP runningus Check that tracy_mcp.py exists and "
-                f"TracyServerBindings are built. Detail: {exc}"
-            ) from exc
-
-        # Start background SSE reader thread (it will detect the endpoint event)
-        self._start_sse_reader()
-
-        # Wait for the endpoint event from the reader thread
-        if not self._endpoint_event.wait(timeout=self._timeout):
-            self._stop_sse_reader()
-            self._cleanup_sse()
-            raise TracyConnectionError(
-                f"Tracy MCP SSE handshake failed - no 'endpoint' event received within {self._timeout}s. "
-                f"Is Tracy MCP running on {addr}us"
-            )
-
-        if not self._message_url:
-            self._stop_sse_reader()
-            self._cleanup_sse()
-            raise TracyConnectionError(
-                f"Tracy MCP SSE handshake failed - endpoint event had no URL. "
-                f"Is Tracy MCP running on {addr}us"
-            )
-
-        # Mark connected now so send_request() passes its self.connected check
-        # for the MCP initialize handshake below.
         self._connected = True
-
-        # Make sure message_url is absolute
-        if not self._message_url.startswith("http"):
-            self._message_url = f"{self._base_url}{self._message_url}"
-
-        # MCP handshake: initialize request, then initialized notification
-        try:
-            init_params = {
-                "protocolVersion": "2025-11-25",
-                "capabilities": {},
-                "clientInfo": {"name": "bar_tracy_bridge", "version": "1.0.0"},
-            }
-            init_response = self.send_request("initialize", init_params, timeout=5.0)
-
-            if "error" in init_response:
-                logger.warning(
-                    "Tracy MCP initialize error: %s",
-                    init_response["error"].get("message", "unknown"),
-                )
-            else:
-                logger.info(
-                    "Tracy MCP initialized (protocol: %s)",
-                    init_response.get("result", {}).get("protocolVersion"),
-                )
-
-            # Send initialized notification (no response expected)
-            self._send_notification("notifications/initialized")
-        except TracyConnectionError as exc:
-            logger.warning("Tracy MCP initialize failed (non-fatal): %s", exc)
-
-        logger.info("Connected to Tracy MCP on %s (endpoint: %s)", addr, self._message_url)
-
-    @staticmethod
-    def _parse_sse_event(text: str) -> tuple:
-        """Parse an SSE event block into (event_type, data).
-
-        SSE format:
-            event: <type>\n
-            data: <json>\n
-            \n
-
-        Multi-line data is supported per the SSE spec: consecutive ``data:``
-        lines are joined with newlines into a single payload.
-        """
-        event_type = "message"  # default event type
-        data_lines: list[str] = []
-
-        for line in text.split("\n"):
-            if line.startswith("event: "):
-                event_type = line[7:].strip()
-            elif line.startswith("data: "):
-                data_lines.append(line[6:])
-            elif line.startswith("data"):
-                # edge case: ``data:value`` (no space after colon)
-                data_lines.append(line[4:])
-
-        return event_type, "\n".join(data_lines)
+        bindings = _load_tracy_bindings()
+        if bindings is None:
+            logger.warning("Tracy local backend is up, but bindings are unavailable: %s", _tracy_bindings_error)
+        else:
+            logger.info("Tracy local backend ready with TracyServerBindings loaded")
 
     def disconnect(self) -> None:
-        """Close the SSE session and stop the reader thread."""
-        if self._connected:
-            logger.info("Disconnecting from Tracy MCP")
-        self._stop_sse_reader()
-        self._cleanup_sse()
         self._connected = False
-        self._message_url = None
-
-    def reconnect(self) -> None:
-        """Attempt to reconnect to Tracy MCP indefinitely."""
-        attempt = 1
-        while True:
-            try:
-                with self._conn_lock:
-                    self.disconnect()
-                    self.connect()
-                logger.info("Successfully reconnected to Tracy MCP")
-                return
-            except TracyConnectionError as exc:
-                wait = min(1.0 * (2 ** (attempt - 1)), 60.0)
-                logger.warning("Tracy MCP reconnect attempt %d failed: %s (waiting %.1fs)", attempt, exc, wait)
-                time.sleep(wait)
-                attempt += 1
-
-    def _cleanup_sse(self) -> None:
-        """Close the SSE stream and clean up resources."""
-        if self._sse_context:
-            try:
-                self._sse_context.__exit__(None, None, None)
-            except Exception:
-                pass
-            self._sse_context = None
-        self._sse_stream = None
-
-    # ------------------------------------------------------------------
-    # Background SSE reader thread
-    # ------------------------------------------------------------------
-
-    def _start_sse_reader(self) -> None:
-        """Start the background SSE reader thread."""
-        if self._sse_reader_running and self._sse_reader_thread and self._sse_reader_thread.is_alive():
-            return
-        self._sse_reader_running = True
-        self._sse_reader_thread = threading.Thread(
-            target=self._sse_reader_loop, daemon=True, name="tracy-sse-reader"
-        )
-        self._sse_reader_thread.start()
-
-    def _stop_sse_reader(self) -> None:
-        """Signal the SSE reader thread to stop and wait for it."""
-        self._sse_reader_running = False
-        if self._sse_reader_thread and self._sse_reader_thread.is_alive():
-            self._sse_reader_thread.join(timeout=5.0)
-        self._sse_reader_thread = None
-
-    def _sse_reader_loop(self) -> None:
-        """Background thread: read SSE events and demultiplex responses by ID."""
-        logger.debug("Tracy SSE reader thread started")
-
-        if not self._sse_stream:
-            logger.error("No SSE stream available for reader")
-            return
-
-        buffer = ""
-        try:
-            for line in self._sse_stream.iter_lines():
-                if not self._sse_reader_running:
-                    break
-
-                buffer += line + "\n"
-
-                # Parse complete SSE events
-                while "\n\n" in buffer:
-                    event_text, _, buffer = buffer.partition("\n\n")
-                    event_type, data = self._parse_sse_event(event_text)
-
-                    if event_type == "endpoint":
-                        # First endpoint event - store URL and signal connect()
-                        if not self._message_url:
-                            self._message_url = data.strip()
-                            logger.debug("Tracy SSE -> endpoint event: %s", self._message_url)
-                            self._endpoint_event.set()
-                        else:
-                            logger.debug("Tracy SSE -> duplicate endpoint: %s", data)
-                    elif event_type in ("message", "result"):
-                        # FastMCP (MCP Python SDK) sends JSON-RPC responses as
-                        # 'event: message'.  Handle both 'message' and 'result'
-                        # for forward compatibility.
-                        logger.debug("Tracy SSE <- %s event, data=%s", event_type, data[:200])
-                        self._handle_sse_response(data)
-                    elif event_type == "error":
-                        logger.warning("Tracy SSE -> error event: %s", data[:200])
-                    else:
-                        logger.debug("Tracy SSE -> event [%s]: %s", event_type, data[:100])
-
-        except Exception as exc:
-            logger.warning("Tracy SSE reader thread error: %s", exc)
-        finally:
-            self._connected = False
-            # Notify any pending waiters that the connection is gone.
-            with self._lock:
-                pending = list(self._pending.items())
-                self._pending.clear()
-                for req_id, ev in pending:
-                    self._pending_results[req_id] = TracyConnectionError(
-                        "Tracy MCP SSE connection lost while waiting for response."
-                    )
-                    ev.set()
-            logger.debug("Tracy SSE reader thread stopped")
-
-    def _handle_sse_response(self, data: str) -> None:
-        """Parse an SSE 'result' event and deliver to the waiting request."""
-        if not data.strip():
-            return
-        try:
-            msg = json.loads(data)
-        except json.JSONDecodeError:
-            logger.error("Tracy SSE -> invalid JSON: %s", data[:200])
-            return
-
-        if not isinstance(msg, dict):
-            logger.warning("Tracy SSE -> non-dict response: %s", data[:100])
-            return
-
-        resp_id = msg.get("id")
-        if resp_id is not None:
-            with self._lock:
-                ev = self._pending.pop(int(resp_id), None)
-                if ev:
-                    self._pending_results[int(resp_id)] = msg
-                    ev.set()
-                    logger.debug("Tracy SSE <- response id=%s delivered", resp_id)
-                else:
-                    self._pending_results[int(resp_id)] = msg
-                    logger.debug(
-                        "Tracy SSE <- early/unsolicited response id=%s stored",
-                        resp_id,
-                    )
-        else:
-            # Notification (no id) - dispatch to callbacks
-            method = msg.get("method", "unknown")
-            params = msg.get("params", {})
-            logger.debug("Tracy SSE <- notification: method=%s", method)
-            for cb in self._notification_callbacks:
-                try:
-                    cb(method, params)
-                except Exception as cb_exc:
-                    logger.warning("Tracy notification callback error: %s", cb_exc)
-
-    # ------------------------------------------------------------------
-    # JSON-RPC messaging
-    # ------------------------------------------------------------------
-
-    def _next_id(self) -> int:
-        """Generate the next unique request ID."""
-        self._request_id += 1
-        return self._request_id
-
-    def _wait_for_response(self, request_id: int, timeout: float) -> Dict[str, Any]:
-        """Wait for the SSE response matching a specific request ID."""
-        with self._lock:
-            result = self._pending_results.pop(request_id, None)
-            if result is not None:
-                if isinstance(result, TracyConnectionError):
-                    raise result
-                return result
-
-            ev = self._pending.get(request_id)
-            if ev is None:
-                ev = threading.Event()
-                self._pending[request_id] = ev
-
-        if not ev.wait(timeout=timeout):
-            with self._lock:
-                self._pending.pop(request_id, None)
-            raise TracyConnectionError(
-                f"Timeout waiting for Tracy MCP response id={request_id} after {timeout}s."
-            )
-
-        with self._lock:
-            result = self._pending_results.pop(request_id, None)
-        if isinstance(result, TracyConnectionError):
-            raise result
-        if result is None:
-            raise TracyConnectionError(
-                f"No response received for Tracy MCP request id={request_id}."
-            )
-        return result
-
-    def send_request(
-        self,
-        method: str,
-        params: Optional[Dict[str, Any]] = None,
-        timeout: Optional[float] = None,
-    ) -> Dict[str, Any]:
-        """Send a JSON-RPC request to Tracy MCP and wait for SSE response.
-
-        POSTs to the message endpoint, then waits for the matching 'result'
-        event on the SSE stream.
-
-        Returns the parsed JSON-RPC response dict.
-        Raises TracyConnectionError on transport or protocol errors.
-        """
-        if not self.connected:
-            raise TracyConnectionError(
-                "Not connected to Tracy MCP - call connect() first. "
-                "Is Tracy MCP runningus"
-            )
-
-        with self._lock:
-            req_id = self._next_id()
-            self._pending[req_id] = threading.Event()
-        msg: Dict[str, Any] = {
-            "jsonrpc": "2.0",
-            "method": method,
-            "id": req_id,
-        }
-        if params is not None:
-            msg["params"] = params
-
-        req_timeout = timeout or self._timeout
-
-        logger.debug("Tracy SSE -> POST id=%s method=%s", req_id, method)
-
-        try:
-            # POST to the message endpoint (fire-and-forget, response comes via SSE)
-            resp = self._httpx.post(
-                self._message_url,
-                json=msg,
-                timeout=req_timeout,
-            )
-
-            if resp.status_code not in (200, 202):
-                logger.error(
-                    "Tracy SSE POST failed with status %d: %s",
-                    resp.status_code, resp.text[:200],
-                )
-                # Don't raise yet - the response might still arrive via SSE
-                # Fall through to wait_for_response
-
-        except Exception as exc:
-            logger.warning("Tracy SSE POST error: %s", exc)
-            # Fall through to wait_for_response - might still arrive
-
-        # Wait for response on SSE stream
-        return self._wait_for_response(req_id, req_timeout)
-
-    def _send_notification(self, method: str, params: Optional[Dict[str, Any]] = None) -> None:
-        """Send a JSON-RPC 2.0 notification to Tracy MCP (no id, no response expected)."""
-        if not self.connected:
-            raise TracyConnectionError("Not connected to Tracy MCP")
-
-        msg: Dict[str, Any] = {
-            "jsonrpc": "2.0",
-            "method": method,
-        }
-        if params is not None:
-            msg["params"] = params
-
-        logger.debug("Tracy SSE -> (notification) %s", json.dumps(msg)[:200])
-
-        try:
-            self._httpx.post(
-                self._message_url,
-                json=msg,
-                timeout=self._timeout,
-            )
-        except Exception as exc:
-            logger.warning("Tracy SSE notification POST error: %s", exc)
 
     def discover_tools(self, timeout: float = 15.0) -> List[Dict[str, Any]]:
-        """Query Tracy MCP for the list of available tools.
+        return [dict(tool) for tool in TRACY_LOCAL_TOOL_SCHEMAS]
 
-        Returns the raw tools list from the MCP `tools/list` response.
-        """
-        logger.info("Discovering Tracy MCP tools ...")
-        response = self.send_request("tools/list", None, timeout)
-
-        if "error" in response:
-            raise TracyConnectionError(
-                f"Tracy MCP tools/list error: "
-                f"{response['error'].get('message', 'unknown')}"
-            )
-
-        result = response.get("result", {})
-        tools = result.get("tools", [])
-        logger.info(
-            "Discovered %d Tracy MCP tools: %s",
-            len(tools),
-            ", ".join(t.get("name", "us") for t in tools),
-        )
-        return tools
-
-    def call_tool(
-        self,
-        tool_name: str,
-        arguments: Optional[Dict[str, Any]] = None,
-        timeout: Optional[float] = None,
-    ) -> Any:
-        """Call a Tracy MCP tool and return the result.
-
-        Args:
-            tool_name: Tool name (e.g., "eval", "list_instances")
-            arguments: Dict of arguments for the tool
-            timeout: Override timeout for this request
-
-        Returns:
-            The tool's result (parsed from JSON-RPC response)
-        """
-        params = {"name": tool_name}
-        if arguments:
-            params["arguments"] = arguments
-
-        response = self.send_request("tools/call", params, timeout)
-
-        if "error" in response:
-            raise TracyConnectionError(
-                f"Tracy MCP error for '{tool_name}': "
-                f"{response['error'].get('message', 'unknown')}"
-            )
-
-        return response.get("result")
+    def call_tool(self, tool_name: str, arguments: Optional[Dict[str, Any]] = None, timeout: Optional[float] = None) -> Any:
+        if not self.connected:
+            raise TracyConnectionError("Tracy local backend is not connected.")
+        args = arguments or {}
+        try:
+            if tool_name == "list_instances":
+                value = _run_coroutine_sync(_tracy_list_instances())
+            elif tool_name == "discover_instances":
+                value = _run_coroutine_sync(_tracy_discover_instances(**args))
+            elif tool_name == "live_connect":
+                value = _run_coroutine_sync(_tracy_live_connect(**args))
+            elif tool_name == "disconnect_instance":
+                value = _run_coroutine_sync(_tracy_disconnect_instance(**args))
+            elif tool_name == "eval":
+                value = _run_coroutine_sync(_tracy_eval(**args))
+            elif tool_name == "task":
+                value = _run_coroutine_sync(_tracy_task(**args))
+            else:
+                raise TracyConnectionError(f"Unknown Tracy tool '{tool_name}'.")
+        except TypeError as exc:
+            raise TracyConnectionError(f"Invalid arguments for Tracy tool '{tool_name}': {exc}") from exc
+        return _tracy_tool_result(value, is_error=isinstance(value, str) and value.startswith("Error:"))
 
 
 class TracyToolRegistry:
-    """Discovers Tracy MCP tools via `tools/list` for internal bridge use.
+    """Discovers in-process Tracy tools for internal bridge use.
 
-    The bridge deliberately does not expose raw Tracy MCP tools to the client.
+    The bridge deliberately does not expose raw Tracy tools to the client.
     Profiling is the public surface; discovered Tracy tools stay behind the
-    supervisor so file/capture utilities do not clutter MCP tool lists.
+    supervisor so low-level Tracy utilities do not clutter MCP tool lists.
     """
 
-    def __init__(self, client: TracyHttpClient):
+    def __init__(self, client: "TracyLocalClient"):
         self._client = client
         self._tools: List[Dict[str, Any]] = []
         self._tool_map: Dict[str, Dict[str, Any]] = {}
@@ -1213,16 +1137,13 @@ class TracyToolRegistry:
         return list(self._tool_map.keys())
 
     def discover(self, timeout: float = 15.0) -> List[Dict[str, Any]]:
-        """Query Tracy MCP for the list of available tools.
-
-        Sends `tools/list` and caches the result.
-        """
-        logger.info("Discovering Tracy MCP tools ...")
+        """Query the local Tracy client for the list of available tools."""
+        logger.info("Discovering local Tracy tools ...")
         tools = self._client.discover_tools(timeout)
         self._tools = tools
         self._tool_map = {t["name"]: t for t in self._tools}
         logger.info(
-            "Cached %d Tracy MCP tools: %s",
+            "Cached %d Tracy tools: %s",
             len(self._tools),
             ", ".join(t["name"] for t in self._tools),
         )
@@ -1237,7 +1158,7 @@ class TracyToolRegistry:
             timeout: Max seconds to wait for response
 
         Returns:
-            Raw result dict from Tracy MCP.
+            Raw result dict in MCP tool-result shape.
         """
         logger.debug("[BRIDGE:TRACY_REG] call_tool name='%s' arguments=%s", name, arguments)
         if name not in self._tool_map:
@@ -1250,238 +1171,7 @@ class TracyToolRegistry:
         return self._client.call_tool(name, arguments, timeout)
 
 
-class TracyAutoStart:
-    """Manages Tracy MCP lifecycle: check, start, wait, auto-connect.
-
-    On initialization:
-    1. Checks if Tracy MCP is running (PID file)
-    2. If not, spawns tracy_mcp.py as subprocess
-    3. Waits for SSE endpoint to be ready
-    4. Optionally auto-connects to a live Tracy server
-    """
-
-    def __init__(
-        self,
-        script_path: str = _TRACY_MCP_SCRIPT,
-        pid_file: str = _TRACY_MCP_PID_FILE,
-        host: str = TRACY_HOST,
-        port: int = TRACY_PORT,
-    ):
-        self._script_path = script_path
-        self._pid_file = pid_file
-        self._host = host
-        self._port = port
-        self._process: Optional[subprocess.Popen] = None
-        self._started_by_us = False
-
-    @property
-    def process(self) -> Optional[subprocess.Popen]:
-        return self._process
-
-    def _is_running(self) -> bool:
-        """Check if Tracy MCP is running via TCP port liveness check."""
-        try:
-            with socket.create_connection((self._host, self._port), timeout=1.0):
-                return True
-        except (OSError, socket.timeout):
-            return False
-
-    def _wait_for_endpoint(self, timeout: float = 30.0) -> bool:
-        """Poll the SSE endpoint until ready or timeout."""
-        import httpx
-
-        deadline = time.monotonic() + timeout
-        url = f"http://{self._host}:{self._port}/sse"
-
-        while time.monotonic() < deadline:
-            try:
-                with httpx.stream(
-                    "GET",
-                    url,
-                    timeout=2.0,
-                    headers={"Accept": "text/event-stream"},
-                ) as response:
-                    if response.status_code == 200:
-                        return True
-            except Exception:
-                pass
-            time.sleep(0.5)
-
-        return False
-
-    def ensure_running(self, auto_start: bool = True) -> bool:
-        """Ensure Tracy MCP is running.
-
-        Args:
-            auto_start: If True, start Tracy MCP if not running.
-
-        Returns:
-            True if Tracy MCP is running, False otherwise.
-        """
-        addr = f"{self._host}:{self._port}"
-
-        if self._is_running():
-            return True
-
-        if not auto_start:
-            logger.warning(
-                "Tracy MCP not running and auto_start=False. "
-                "Tracy tools will not be available."
-            )
-            return False
-
-        # Auto-start Tracy MCP
-        if not os.path.exists(self._script_path):
-            logger.error(
-                "Tracy MCP script not found at %s. "
-                "Cannot auto-start.", self._script_path
-            )
-            return False
-
-        logger.info("Starting Tracy MCP ...")
-        try:
-            python = sys.executable or "python3"
-            self._process = subprocess.Popen(
-                [python, self._script_path],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                cwd=os.path.dirname(self._script_path),
-            )
-            self._started_by_us = True
-            logger.info("Tracy MCP started (PID: %d)", self._process.pid)
-        except Exception as exc:
-            raise TracyConnectionError(
-                f"Failed to start Tracy MCP: {exc}. "
-                f"Check that tracy_mcp.py exists at {self._script_path} "
-                f"and TracyServerBindings are built."
-            ) from exc
-
-        # Wait for SSE endpoint
-        if not self._wait_for_endpoint():
-            # Kill the process
-            if self._process:
-                self._process.terminate()
-                try:
-                    self._process.wait(timeout=5)
-                except subprocess.TimeoutExpired:
-                    self._process.kill()
-            raise TracyConnectionError(
-                f"Tracy MCP failed to start within 30s. "
-                f"Check that tracy_mcp.py exists at {self._script_path} "
-                f"and TracyServerBindings are built. "
-                f"Check stderr output for errors."
-            )
-
-        logger.info("Tracy MCP is ready on %s", addr)
-        return True
-
-    def auto_connect(
-        self,
-        client: TracyHttpClient,
-        address: str = "127.0.0.1",
-        port: int = 8086,
-        alias: Optional[str] = None,
-    ) -> Optional[str]:
-        """Auto-connect Tracy MCP to a live Tracy server.
-
-        Args:
-            client: Connected TracyHttpClient instance
-            address: Tracy server address
-            port: Tracy server port (broadcast port)
-            alias: Optional instance name
-
-        Returns:
-            Instance ID if successful, None if connection failed.
-        """
-        if not client.connected:
-            logger.warning("Tracy MCP not connected, cannot auto-connect")
-            return None
-
-        logger.info(
-            "Auto-connecting Tracy MCP to engine at %s:%d ...", address, port
-        )
-
-        try:
-            result = client.call_tool(
-                "live_connect",
-                {"address": address, "port": port, "alias": alias},
-                timeout=15.0,
-            )
-
-            # call_tool returns the full MCP result dict:
-            #   {"content": [{"type": "text", "text": "..."}], "isError": false}
-            # Extract the plain text string from it.
-            if isinstance(result, dict):
-                content_list = result.get("content", [])
-                text_parts = [
-                    item.get("text", "")
-                    for item in content_list
-                    if isinstance(item, dict) and item.get("type") == "text"
-                ]
-                text_result = "\n".join(text_parts) if text_parts else str(result)
-            else:
-                text_result = str(result) if result is not None else ""
-
-            if text_result.startswith("Error"):
-                logger.warning("Tracy live_connect failed: %s", text_result)
-                return None
-
-            # The text contains: "Connected to live instance as 'live_engine'. ..."
-            # Extract the instance alias from the response.
-            match = re.search(r"as '([^']+)'", text_result)
-            instance_id = match.group(1) if match else "live_engine"
-            logger.info("Tracy MCP connected to engine: %s", text_result[:100])
-            return instance_id
-
-        except TracyConnectionError as exc:
-            import traceback
-            logger.warning(
-                "Tracy live_connect failed - exception details:"
-            )
-            logger.warning(
-                "  Exception type    : %s",
-                type(exc).__name__,
-            )
-            logger.warning(
-                "  Exception message : %s",
-                str(exc),
-            )
-            logger.warning(
-                "  Exception args    : %s",
-                exc.args,
-            )
-            logger.warning(
-                "  Connection target : %s:%d",
-                address, port,
-            )
-            logger.warning(
-                "  Instance alias    : %s",
-                alias,
-            )
-            logger.warning(
-                "  Client connected  : %s",
-                client.connected if client else False,
-            )
-            if client and hasattr(client, "_message_url"):
-                logger.warning(
-                    "  SSE message URL   : %s",
-                    client._message_url,
-                )
-            logger.warning(
-                "  Traceback         :\n%s",
-                "".join(traceback.format_exception(type(exc), exc, exc.__traceback__)),
-            )
-            logger.warning(
-                "  Hint              : is the engine built with TRACY_ENABLE? "
-                "Is Tracy MCP running and healthyus"
-            )
-            return None
-
-    def cleanup(self) -> None:
-        """Clean up resources (don't kill Tracy MCP - it may be shared)."""
-        # We don't kill Tracy MCP on exit since it may be used by other tools
-        # The PID file cleanup is handled by tracy_mcp.py itself
-        pass
+TracyHttpClient = TracyLocalClient
 
 
 # ---------------------------------------------------------------------------
@@ -1495,7 +1185,7 @@ class ProfileCollector:
     def __init__(
         self,
         bar_registry: BarToolRegistry,
-        tracy_client: TracyHttpClient,
+        tracy_client: TracyLocalClient,
         tracy_instance_id: str,
     ):
         self._bar = bar_registry
@@ -1840,13 +1530,23 @@ def create_bridge_server() -> Any:
 
 This server exposes tools for the game Beyond All Reason (BAR) on the Recoil Engine (SpringRTS) for developing and profiling BAR LuaUI widgets and LuaRules gadgets, with deep integration to Tracy for performance insights.
 
-Tracy profiling should be done by adding searchable zones in the Lua code, e.g. tracy.ZoneBeginN("MyWidget:Update") / tracy.ZoneEnd(), then calling profile_zone_pattern with a regex such as "^MyWidget:".
+Tracy profiling should be done by adding searchable zones in the Lua code, e.g. tracy.ZoneBeginN("My Widget:Update") / tracy.ZoneEnd(), then calling profile_zone_pattern with a regex such as "^My Widget:".
 
 Example:
 
 '''lua 
+
+function widget:GetInfo() -- similarly for gadget:GetInfo()
+	return {
+		name = "My Widget", -- use this name in zone name pattern
+		desc = "Description",
+        -- ...other widget info...
+	}
+end
+
+
 function foo(bar)
-    tracy.ZoneBeginN("MyWidget:foo") -- start a zone with a custom name (appears in Tracy UI)
+    tracy.ZoneBeginN("My Widget:foo") -- start a zone with a custom name (appears in Tracy UI)
     
     -- do work here  
     
@@ -1866,12 +1566,21 @@ end
 - Focus on code that runs repeatedly during gameplay, such as:
     - Update(), MousePress(), GameFrame(), etc.
 - Functions such as `function widget:Update()` are called every frame, so they are prime candidates for profiling. Instrumenting them with zones allows you to see how much time is spent in each part of the update logic across frames.
-- Some functions are already pre-instrumented, such as `widget:GameFrame()`, with the zone naming: "W:GameFrame:MyWidget" for widget code and "G:GameFrame:MyGadget" for gadget code.
+- Some functions are already pre-instrumented, such as `widget:GameFrame()`, with the zone naming: "W:GameFrame:My Widget" for widget code and "G:GameFrame:My Gadget" for gadget code.
 - You only need to do short replace_string_in_file tool calls to add zones, you dont need to repeat the entire function body. Use the existing code and just add tracy.ZoneBeginN / ZoneEnd calls around the parts you want to profile in separate replace_string_in_file tool calls. 
 - IMPORTANT: Do not use any emojis, symbols, or decorative characters in your responses.
 - FORMAT: Respond exclusively using plain text and standard punctuation.
 
 """)
+    if hasattr(server, "resource"):
+        @server.resource("tracy://prompt")
+        def tracy_prompt_resource() -> str:
+            return _read_text(_PROMPT_PATH)
+
+        @server.resource("tracy://eval-guide")
+        def tracy_eval_guide_resource() -> str:
+            return _read_text(_EVAL_GUIDE_PATH)
+
     return server
 
 
@@ -2389,7 +2098,7 @@ class BarBackendSupervisor:
 
 
 class TracyBackendSupervisor:
-    """Keeps Tracy MCP and the live engine Tracy instance reconnectable."""
+    """Keeps the in-process Tracy tools and live engine instance reconnectable."""
 
     def __init__(
         self,
@@ -2399,7 +2108,9 @@ class TracyBackendSupervisor:
         port: int = TRACY_PORT,
         engine_address: str = "127.0.0.1",
         engine_port: int = 8086,
+        engine_port_range: str = TRACY_ENGINE_PORT_RANGE,
         engine_alias: str = "live_engine",
+        client_factory: Optional[Callable[[str, int], TracyLocalClient]] = None,
     ) -> None:
         self._server = server
         self._notifier = notifier
@@ -2407,21 +2118,24 @@ class TracyBackendSupervisor:
         self._port = port
         self._engine_address = engine_address
         self._engine_port = engine_port
+        self._engine_port_range = engine_port_range
         self._engine_alias = engine_alias
-        self._auto = TracyAutoStart(host=host, port=port)
+        self._client_factory = client_factory or (lambda host, port: TracyLocalClient(host, port))
         self._lock = threading.RLock()
         self._connect_lock = threading.Lock()
         self._stop_event = threading.Event()
         self._monitor_thread: Optional[threading.Thread] = None
         self._installed_tools: Set[str] = set()
+        self._profile_tool_defs: Dict[str, tuple[str, Callable[..., Any]]] = {}
         self._backoff = 1.0
-        self.client: Optional[TracyHttpClient] = None
+        self.client: Optional[TracyLocalClient] = None
         self.registry: Optional[TracyToolRegistry] = None
         self.mcp_state = "offline"
         self.engine_state = "offline"
         self.generation = 0
         self.engine_generation = 0
         self.instance_id: Optional[str] = None
+        self.last_discovered: List[Dict[str, Any]] = []
         self.last_error: Optional[str] = None
         self.last_ready_at: Optional[float] = None
 
@@ -2449,9 +2163,19 @@ class TracyBackendSupervisor:
                 "tool_names": self.registry.tool_names if self.registry else [],
                 "last_error": self.last_error,
                 "last_ready_at": self.last_ready_at,
-                "target": f"{self._host}:{self._port}",
+                "target": "in-process",
                 "engine_target": f"{self._engine_address}:{self._engine_port}",
+                "engine_scan_range": self._engine_port_range,
+                "engine_discovered": list(self.last_discovered),
+                "profile_tool_names": sorted(self._installed_tools),
+                "bindings_available": getattr(self.client, "bindings_available", None) if self.client else _tracy_bindings is not None,
+                "bindings_error": getattr(self.client, "bindings_error", None) if self.client else _tracy_bindings_error,
             }
+
+    def set_profile_tools(self, tools: Dict[str, tuple[str, Callable[..., Any]]]) -> None:
+        with self._lock:
+            self._profile_tool_defs = dict(tools)
+        self._install_dynamic_tools()
 
     def ensure_mcp_ready(self, timeout: float = 30.0) -> None:
         with self._lock:
@@ -2466,9 +2190,7 @@ class TracyBackendSupervisor:
                 self.mcp_state = "connecting"
                 self.last_error = None
             self._disconnect_client()
-            if not self._auto.ensure_running(auto_start=True):
-                raise TracyConnectionError("Tracy MCP is not running and could not be auto-started.")
-            client = TracyHttpClient(self._host, self._port)
+            client = self._client_factory(self._host, self._port)
             client.connect()
             registry = TracyToolRegistry(client)
             registry.discover()
@@ -2481,7 +2203,7 @@ class TracyBackendSupervisor:
                 self.last_ready_at = time.time()
                 self._backoff = 1.0
             self._install_dynamic_tools()
-            logger.info("Tracy MCP backend ready (generation %d)", self.generation)
+            logger.info("Tracy local backend ready (generation %d)", self.generation)
         except Exception as exc:
             self.mark_mcp_offline(str(exc))
             raise
@@ -2495,20 +2217,22 @@ class TracyBackendSupervisor:
                 return self.instance_id
             client = self.client
         if not client:
-            raise TracyConnectionError("Tracy MCP client is unavailable.")
+            raise TracyConnectionError("Tracy local client is unavailable.")
         with self._lock:
             self.engine_state = "connecting"
-        instance_id = self._auto.auto_connect(client, address=self._engine_address, port=self._engine_port, alias=self._engine_alias)
+        instance_id = self._scan_and_connect_engine(client)
         if not instance_id:
             with self._lock:
                 self.engine_state = "offline"
-                self.last_error = "Tracy MCP could not connect to the live engine."
-            raise TracyConnectionError(f"Tracy MCP could not connect to the engine at {self._engine_address}:{self._engine_port}.")
+                self.last_error = "Tracy local backend could not connect to the live engine."
+            self._install_dynamic_tools()
+            raise TracyConnectionError(f"Tracy local backend could not connect to the engine at {self._engine_address}:{self._engine_port}.")
         with self._lock:
             self.instance_id = instance_id
             self.engine_state = "ready"
             self.engine_generation += 1
             self.last_error = None
+        self._install_dynamic_tools()
         return instance_id
 
     def refresh_tools(self) -> List[str]:
@@ -2543,7 +2267,7 @@ class TracyBackendSupervisor:
         raise TracyConnectionError(f"Tracy tool '{name}' failed after reconnect: {last_exc}")
 
     def mark_mcp_offline(self, error: str) -> None:
-        logger.warning("Tracy MCP backend marked offline: %s", error)
+        logger.warning("Tracy local backend marked offline: %s", error)
         with self._lock:
             self.mcp_state = "offline"
             self.engine_state = "offline"
@@ -2551,6 +2275,7 @@ class TracyBackendSupervisor:
             self.last_error = error
             self.generation += 1
         self._disconnect_client()
+        self._install_dynamic_tools()
 
     def mark_engine_offline(self, error: str) -> None:
         logger.warning("Tracy engine backend marked offline: %s", error)
@@ -2559,6 +2284,7 @@ class TracyBackendSupervisor:
             self.instance_id = None
             self.last_error = error
             self.engine_generation += 1
+        self._install_dynamic_tools()
 
     def _disconnect_client(self) -> None:
         client = self.client
@@ -2581,12 +2307,98 @@ class TracyBackendSupervisor:
             return False
         return False
 
+    def _scan_and_connect_engine(self, client: TracyLocalClient) -> Optional[str]:
+        if not client.connected:
+            logger.warning("Tracy local backend is not connected; cannot auto-connect engine")
+            return None
+
+        targets = self._engine_scan_targets(client)
+        logger.info(
+            "Scanning %d Tracy engine target(s): %s",
+            len(targets),
+            ", ".join(f"{host}:{port}" for host, port in targets),
+        )
+        failures: List[str] = []
+        for address, port in targets:
+            instance_id = self._try_connect_engine(client, address, port)
+            if instance_id:
+                with self._lock:
+                    self._engine_address = address
+                    self._engine_port = port
+                return instance_id
+            failures.append(f"{address}:{port}")
+        logger.warning("No Tracy engine connected after scanning: %s", ", ".join(failures))
+        return None
+
+    def _engine_scan_targets(self, client: TracyLocalClient) -> List[tuple[str, int]]:
+        targets: List[tuple[str, int]] = [(self._engine_address, self._engine_port)]
+        discovered: List[Dict[str, Any]] = []
+        try:
+            result = client.call_tool("discover_instances", {"port_range": self._engine_port_range}, timeout=5.0)
+            data = _mcp_result_to_data(result)
+            if isinstance(data, list):
+                discovered = [item for item in data if isinstance(item, dict)]
+        except Exception as exc:
+            logger.debug("Tracy engine port scan failed for range %s: %s", self._engine_port_range, exc)
+
+        with self._lock:
+            self.last_discovered = list(discovered)
+
+        for item in discovered:
+            try:
+                port = int(item.get("port"))
+            except (TypeError, ValueError):
+                continue
+            address = str(item.get("address") or self._engine_address or "127.0.0.1")
+            targets.append((address, port))
+
+        unique: List[tuple[str, int]] = []
+        seen: Set[tuple[str, int]] = set()
+        for target in targets:
+            if target not in seen:
+                seen.add(target)
+                unique.append(target)
+        return unique
+
+    def _try_connect_engine(self, client: TracyLocalClient, address: str, port: int) -> Optional[str]:
+        logger.info("Auto-connecting Tracy backend to engine at %s:%d ...", address, port)
+        try:
+            result = client.call_tool(
+                "live_connect",
+                {"address": address, "port": port, "alias": self._engine_alias},
+                timeout=15.0,
+            )
+            text_result = _mcp_result_to_text(result)
+            if text_result.startswith(("Error", "Failed", "Protocol mismatch", "Reached ")):
+                logger.warning("Tracy live_connect failed: %s", text_result)
+                return None
+            match = re.search(r"as '([^']+)'", text_result)
+            instance_id = match.group(1) if match else self._engine_alias
+            logger.info("Tracy connected to engine: %s", text_result[:100])
+            return instance_id
+        except Exception as exc:
+            logger.warning("Tracy live_connect failed for %s:%d alias=%s: %s", address, port, self._engine_alias, exc)
+            return None
+
     def _install_dynamic_tools(self) -> None:
-        for old_name in list(self._installed_tools):
-            _remove_tool(self._server, old_name)
-        if self._installed_tools:
-            self._installed_tools = set()
-            self._notifier.notify("tracy", [])
+        with self._lock:
+            desired = set(self._profile_tool_defs.keys()) if self.engine_state == "ready" else set()
+            installed = set(self._installed_tools)
+            tool_defs = dict(self._profile_tool_defs)
+
+        changed = False
+        for old_name in installed - desired:
+            changed = _remove_tool(self._server, old_name) or changed
+        for tool_name in desired:
+            desc, func = tool_defs[tool_name]
+            _install_or_replace_tool(self._server, tool_name, desc, func)
+            changed = True
+
+        with self._lock:
+            self._installed_tools = desired
+
+        if changed or installed != desired:
+            self._notifier.notify("tracy", sorted(desired))
 
     def _monitor_loop(self) -> None:
         while not self._stop_event.is_set():
@@ -2595,7 +2407,9 @@ class TracyBackendSupervisor:
                 if self.mcp_state != "ready":
                     self.ensure_mcp_ready(timeout=5.0)
                 elif self.client and not self.client.connected:
-                    self.mark_mcp_offline("Tracy SSE stream disconnected")
+                    self.mark_mcp_offline("Tracy local client disconnected")
+                elif self.engine_state != "ready":
+                    self.ensure_engine_ready()
                 elif self.instance_id and self.engine_state == "ready":
                     with self._lock:
                         exists = self._instance_exists_locked(self.instance_id)
@@ -2620,18 +2434,24 @@ def _bridge_status_payload(bar_backend: BarBackendSupervisor, tracy_backend: Tra
         "bar": bar,
         "tracy_mcp": {
             "state": tracy["mcp_state"],
+            "mode": "in-process",
             "generation": tracy["generation"],
             "tools": tracy["tools"],
             "tool_names": tracy["tool_names"],
             "last_error": tracy["last_error"],
             "last_ready_at": tracy["last_ready_at"],
             "target": tracy["target"],
+            "bindings_available": tracy.get("bindings_available"),
+            "bindings_error": tracy.get("bindings_error"),
         },
         "tracy_engine": {
             "state": tracy["engine_state"],
             "generation": tracy["engine_generation"],
             "instance_id": tracy["instance_id"],
             "target": tracy["engine_target"],
+            "scan_range": tracy.get("engine_scan_range"),
+            "discovered": tracy.get("engine_discovered", []),
+            "profile_tool_names": tracy.get("profile_tool_names", []),
         },
         "profile_tools_available": tracy["mcp_state"] == "ready" and tracy["engine_state"] == "ready",
         "profile_reload_available": bar["state"] == "ready" and tracy["mcp_state"] == "ready" and tracy["engine_state"] == "ready",
@@ -2639,8 +2459,9 @@ def _bridge_status_payload(bar_backend: BarBackendSupervisor, tracy_backend: Tra
         "tool_notifications": notifier.status(),
         "config": {
             "bar_target": f"{BAR_HOST}:{BAR_PORT}",
-            "tracy_mcp_target": f"{TRACY_HOST}:{TRACY_PORT}",
+            "tracy_mcp_target": "in-process",
             "tracy_engine_target": f"{TRACY_ENGINE_HOST}:{TRACY_ENGINE_PORT}",
+            "tracy_engine_port_range": TRACY_ENGINE_PORT_RANGE,
             "tracy_engine_alias": TRACY_ENGINE_ALIAS,
         },
     }
@@ -2698,7 +2519,7 @@ def _reload_tool_from_kind(reload_kind: str = "", reload_name: str = "") -> Opti
 
 
 def register_stable_bridge_tools(server: Any, bar_backend: BarBackendSupervisor, tracy_backend: TracyBackendSupervisor, notifier: ToolListNotifier) -> None:
-    @server.tool(description="Return BAR, Tracy MCP, Tracy engine, and dynamic tool discovery status.")
+    @server.tool(description="Return BAR, local Tracy backend, Tracy engine, and dynamic tool discovery status.")
     def bridge_status() -> str:
         return json.dumps(_bridge_status_payload(bar_backend, tracy_backend, notifier), indent=2)
 
@@ -2707,7 +2528,7 @@ def register_stable_bridge_tools(server: Any, bar_backend: BarBackendSupervisor,
         status = _bridge_status_payload(bar_backend, tracy_backend, notifier)
         dynamic = {
             "bar": status["bar"]["tool_names"],
-            "tracy": [],
+            "tracy": status["tracy_engine"].get("profile_tool_names", []),
             "notification_generation": status["tool_notification_generation"],
         }
         return json.dumps(dynamic, indent=2)
@@ -2746,7 +2567,6 @@ def register_stable_bridge_tools(server: Any, bar_backend: BarBackendSupervisor,
         names = bar_backend.refresh_tools()
         return f"BAR tools refreshed ({len(names)}): {', '.join(names)}"
 
-    @server.tool(description="Profile Tracy zones matching a Python regex. Optionally reload a widget or gadget first with reload_kind='widget' or 'gadget' and reload_name.")
     def profile_zone_pattern(zone_pattern: str, duration: float = 5.0, reload_kind: str = "", reload_name: str = "") -> str:
         return _run_profile_with_retry(
             bar_backend,
@@ -2759,7 +2579,6 @@ def register_stable_bridge_tools(server: Any, bar_backend: BarBackendSupervisor,
             diff=False,
         )
 
-    @server.tool(description="Run two profiling passes for Tracy zones matching a Python regex and return the pass-to-pass delta. Optionally reload a widget or gadget before each pass.")
     def profile_zone_pattern_diff(zone_pattern: str, duration: float = 5.0, reload_kind: str = "", reload_name: str = "") -> str:
         return _run_profile_with_retry(
             bar_backend,
@@ -2771,6 +2590,19 @@ def register_stable_bridge_tools(server: Any, bar_backend: BarBackendSupervisor,
             reload_name=reload_name,
             diff=True,
         )
+
+    tracy_backend.set_profile_tools(
+        {
+            "profile_zone_pattern": (
+                "Profile Tracy zones matching a Python regex. Optionally reload a widget or gadget first with reload_kind='widget' or 'gadget' and reload_name.",
+                profile_zone_pattern,
+            ),
+            "profile_zone_pattern_diff": (
+                "Run two profiling passes for Tracy zones matching a Python regex and return the pass-to-pass delta. Optionally reload a widget or gadget before each pass.",
+                profile_zone_pattern_diff,
+            ),
+        }
+    )
 
 
 
@@ -2793,7 +2625,7 @@ def main() -> None:
     logger.info("=" * 60)
     logger.info("BAR + Tracy Bridge MCP Server starting")
     logger.info("BAR target:   %s:%d", BAR_HOST, BAR_PORT)
-    logger.info("Tracy target: %s:%d", TRACY_HOST, TRACY_PORT)
+    logger.info("Tracy backend: in-process TracyServerBindings")
     logger.info("Transport:    %s", args.transport)
     logger.info("=" * 60)
 
@@ -2808,6 +2640,7 @@ def main() -> None:
         TRACY_PORT,
         engine_address=TRACY_ENGINE_HOST,
         engine_port=TRACY_ENGINE_PORT,
+        engine_port_range=TRACY_ENGINE_PORT_RANGE,
         engine_alias=TRACY_ENGINE_ALIAS,
     )
 

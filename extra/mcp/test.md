@@ -19,9 +19,9 @@ The bar_tracy_bridge.py logs here: `N:\github\tracy\extra\mcp\bar_tracy_bridge.l
 ## Tool Test Cases
 
 ### 2. `list_instances`
-**Purpose**: List all loaded Tracy instances.
+**Purpose**: List live Tracy instances.
 - [ ] **Initial State**: Call with no instances loaded. Verify it returns an empty list `[]`.
-- [ ] **Loaded State**: Load a capture using `load_capture`. Call `list_instances` and verify the new instance appears in the list with correct metadata.
+- [ ] **Connected State**: Connect to a live Tracy application. Call `list_instances` and verify the live instance appears in the list.
 
 ### 3. `discover_instances`
 **Purpose**: Scan local ports for Tracy broadcasts.
@@ -36,7 +36,7 @@ The bar_tracy_bridge.py logs here: `N:\github\tracy\extra\mcp\bar_tracy_bridge.l
 
 ### 7. `eval`
 **Purpose**: Execute Python code against a worker.
-- [ ] **Sync Success**: Load a capture. Call `eval(code="ctx.get_stats()", instance_id="...")`. Verify it returns the result of the call.
+- [ ] **Sync Success**: Connect to a live Tracy application. Call `eval(code="ctx.get_stats()", instance_id="...")`. Verify it returns the result of the call.
 - [ ] **Sync Error**: Call `eval(code="1/0", instance_id="...")`. Verify it returns the Python exception string.
 - [ ] **Async Success**: Call `eval(code="ctx.get_stats()", instance_id="...", async_mode=True)`. Verify it returns a `task_id`.
 - [ ] **Async Poll**: Use the `task_id` from the previous step to call `task(action="poll", task_id="...")`. Verify it returns the result once completed.
