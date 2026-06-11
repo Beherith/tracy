@@ -1867,7 +1867,8 @@ end
     - Update(), MousePress(), GameFrame(), etc.
 - Functions such as `function widget:Update()` are called every frame, so they are prime candidates for profiling. Instrumenting them with zones allows you to see how much time is spent in each part of the update logic across frames.
 - Some functions are already pre-instrumented, such as `widget:GameFrame()`, with the zone naming: "W:GameFrame:MyWidget" for widget code and "G:GameFrame:MyGadget" for gadget code.
- 
+- You only need to do short replace_string_in_file tool calls to add zones, you dont need to repeat the entire function body. Use the existing code and just add tracy.ZoneBeginN / ZoneEnd calls around the parts you want to profile in separate replace_string_in_file tool calls. 
+
     """)
     return server
 
