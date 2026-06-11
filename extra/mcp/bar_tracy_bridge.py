@@ -22,11 +22,11 @@ Usage:
     python extra/mcp/bar_tracy_bridge.py --transport sse --host 127.0.0.1 --port 47381
 
 Environment variables:
-    BAR_MCP_HOST      — BAR MCP hostname  (default: 127.0.0.1)
-    BAR_MCP_PORT      — BAR MCP port      (default: 23452)
-    TRACY_MCP_HOST    — Tracy MCP hostname (default: 127.0.0.1)
-    TRACY_MCP_PORT    — Tracy MCP port    (default: 47380)
-    BRIDGE_LOG_LEVEL  — Log level         (default: INFO)
+    BAR_MCP_HOST      - BAR MCP hostname  (default: 127.0.0.1)
+    BAR_MCP_PORT      - BAR MCP port      (default: 23452)
+    TRACY_MCP_HOST    - Tracy MCP hostname (default: 127.0.0.1)
+    TRACY_MCP_PORT    - Tracy MCP port    (default: 47380)
+    BRIDGE_LOG_LEVEL  - Log level         (default: INFO)
 """
 
 from __future__ import annotations
@@ -101,7 +101,7 @@ BRIDGE_STARTUP_BAR_PROBE = _env_flag("BRIDGE_STARTUP_BAR_PROBE", True)
 BRIDGE_STARTUP_BAR_TIMEOUT = _env_float("BRIDGE_STARTUP_BAR_TIMEOUT", 2.0)
 
 # ---------------------------------------------------------------------------
-# Phase 1.1 — BarTcpClient
+# Phase 1.1 - BarTcpClient
 # ---------------------------------------------------------------------------
 
 
@@ -150,7 +150,7 @@ class BarTcpClient:
         self._reader_running = False
         self._reader_thread: Optional[threading.Thread] = None
 
-        # Notification callbacks (for handling server→client notifications)
+        # Notification callbacks (for handling server->client notifications)
         self._notification_callbacks: List[callable] = []
 
     # ------------------------------------------------------------------
@@ -175,7 +175,7 @@ class BarTcpClient:
         Raises BarConnectionError if the connection cannot be established.
         """
         addr = f"{self._host}:{self._port}"
-        logger.info("Connecting to BAR MCP on %s …", addr)
+        logger.info("Connecting to BAR MCP on %s ...", addr)
 
         connect_timeout = self._connect_timeout if timeout is None else timeout
 
@@ -189,7 +189,7 @@ class BarTcpClient:
         except OSError as exc:
             self._cleanup_sock()
             raise BarConnectionError(
-                f"Cannot connect to BAR MCP on {addr} — "
+                f"Cannot connect to BAR MCP on {addr} - "
                 f"is the game running with dev mode enabled? "
                 f"(Spring.Utilities.IsDevMode())  Detail: {exc}"
             ) from exc
@@ -295,7 +295,7 @@ class BarTcpClient:
 
                     try:
                         obj, end_pos = decoder.raw_decode(self._buffer)
-                        # Successfully parsed a JSON object — consume it
+                        # Successfully parsed a JSON object - consume it
                         self._buffer = self._buffer[end_pos:]
 
                         msg = self._parse_jsonrpc_obj(obj)
@@ -304,13 +304,13 @@ class BarTcpClient:
                         else:
                             logger.debug("BAR TCP <- non-dict JSON: %s", str(obj)[:100])
                     except json.JSONDecodeError:
-                        # Incomplete JSON — need more data from the socket
+                        # Incomplete JSON - need more data from the socket
                         break
 
                 # --- Safety: discard buffer if it grew too large (malformed data) ---
                 if len(self._buffer) > MAX_BUFFER:
                     logger.warning(
-                        "BAR TCP buffer exceeded %d bytes — discarding (likely malformed data)",
+                        "BAR TCP buffer exceeded %d bytes - discarding (likely malformed data)",
                         MAX_BUFFER,
                     )
                     self._buffer = ""
@@ -320,7 +320,7 @@ class BarTcpClient:
                     try:
                         chunk = self._sock.recv(65536)
                     except socket.timeout:
-                        pass  # normal — nothing to read right now
+                        pass  # normal - nothing to read right now
                         continue
                     except OSError:
                         break
@@ -410,7 +410,7 @@ class BarTcpClient:
             self._pending_results.clear()
             for req_id, ev in pending:
                 self._pending_results[req_id] = BarConnectionError(
-                    "Reconnecting — previous request cancelled."
+                    "Reconnecting - previous request cancelled."
                 )
                 ev.set()
 
@@ -419,7 +419,7 @@ class BarTcpClient:
         while True:
             wait = min(self._reconnect_base * (2 ** (attempt - 1)), 60.0)
             logger.warning(
-                "Reconnect attempt %d to BAR MCP on %s (waiting %.1fs) …",
+                "Reconnect attempt %d to BAR MCP on %s (waiting %.1fs) ...",
                 attempt, addr, wait,
             )
             time.sleep(wait)
@@ -452,7 +452,7 @@ class BarTcpClient:
         """
         if not self.connected:
             raise BarConnectionError(
-                "Not connected to BAR MCP — call connect() first. "
+                "Not connected to BAR MCP - call connect() first. "
                 "Is the game running with dev mode enabled?"
             )
 
@@ -479,7 +479,7 @@ class BarTcpClient:
             except OSError as exc:
                 self._cleanup_sock()
                 raise BarConnectionError(
-                    f"Lost connection to BAR MCP while sending — {exc}"
+                    f"Lost connection to BAR MCP while sending - {exc}"
                 ) from exc
 
         return request_id
@@ -506,7 +506,7 @@ class BarTcpClient:
             except OSError as exc:
                 self._cleanup_sock()
                 raise BarConnectionError(
-                    f"Lost connection to BAR MCP while sending notification — {exc}"
+                    f"Lost connection to BAR MCP while sending notification - {exc}"
                 ) from exc
 
     # ------------------------------------------------------------------
@@ -536,7 +536,7 @@ class BarTcpClient:
         Raises BarToolExecutionError if the tool returned isError=true.
 
         Default timeout is 120s because the Lua server processes requests in
-        widget:Update() which runs at game framerate — if the game is slow or
+        widget:Update() which runs at game framerate - if the game is slow or
         paused, large responses (e.g. vfs_read of big files) can take a while.
         """
         params: Dict[str, Any] = {"name": tool_name}
@@ -556,7 +556,7 @@ class BarTcpClient:
         if result.get("isError"):
             text = self._extract_text(result)
             raise BarToolExecutionError(
-                f"BAR MCP tool '{tool_name}' returned error: {text} — "
+                f"BAR MCP tool '{tool_name}' returned error: {text} - "
                 f"check game console for details."
             )
 
@@ -584,7 +584,7 @@ class BarTcpClient:
 
 
 # ---------------------------------------------------------------------------
-# Phase 1.2 — BAR Tool Discovery & Forwarding
+# Phase 1.2 - BAR Tool Discovery & Forwarding
 # ---------------------------------------------------------------------------
 
 
@@ -613,7 +613,7 @@ class BarToolRegistry:
 
         Sends `tools/list` and caches the result.
         """
-        logger.info("Discovering BAR tools …")
+        logger.info("Discovering BAR tools ...")
         response = self._client.call_method("tools/list", None, timeout)
 
         if "error" in response:
@@ -640,7 +640,7 @@ class BarToolRegistry:
             arguments: Dict of arguments matching the tool's inputSchema
             timeout: Max seconds to wait for response (default 120s because
                      the Lua server processes requests in widget:Update() at
-                     game framerate — if paused or slow, responses can take
+                     game framerate - if paused or slow, responses can take
                      a long time)
 
         Returns:
@@ -666,7 +666,7 @@ def _preview_text(value: Any, max_chars: int = 4096) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Phase 2 — Tracy Integration
+# Phase 2 - Tracy Integration
 # ---------------------------------------------------------------------------
 
 
@@ -721,7 +721,7 @@ class TracyHttpClient:
         self._pending: Dict[int, threading.Event] = {}
         self._pending_results: Dict[int, Any] = {}
 
-        # Notification callbacks (for handling server→client notifications)
+        # Notification callbacks (for handling server->client notifications)
         self._notification_callbacks: List[callable] = []
 
     def on_notification(self, callback: callable) -> None:
@@ -749,7 +749,7 @@ class TracyHttpClient:
         Raises TracyConnectionError if the handshake fails.
         """
         addr = f"{self._host}:{self._port}"
-        logger.info("Connecting to Tracy MCP on %s …", addr)
+        logger.info("Connecting to Tracy MCP on %s ...", addr)
 
         try:
             import httpx
@@ -778,8 +778,8 @@ class TracyHttpClient:
             raise
         except Exception as exc:
             raise TracyConnectionError(
-                f"Cannot connect to Tracy MCP on {addr} — "
-                f"is Tracy MCP running? Check that tracy_mcp.py exists and "
+                f"Cannot connect to Tracy MCP on {addr} - "
+                f"is Tracy MCP runningus Check that tracy_mcp.py exists and "
                 f"TracyServerBindings are built. Detail: {exc}"
             ) from exc
 
@@ -791,16 +791,16 @@ class TracyHttpClient:
             self._stop_sse_reader()
             self._cleanup_sse()
             raise TracyConnectionError(
-                f"Tracy MCP SSE handshake failed — no 'endpoint' event received within {self._timeout}s. "
-                f"Is Tracy MCP running on {addr}?"
+                f"Tracy MCP SSE handshake failed - no 'endpoint' event received within {self._timeout}s. "
+                f"Is Tracy MCP running on {addr}us"
             )
 
         if not self._message_url:
             self._stop_sse_reader()
             self._cleanup_sse()
             raise TracyConnectionError(
-                f"Tracy MCP SSE handshake failed — endpoint event had no URL. "
-                f"Is Tracy MCP running on {addr}?"
+                f"Tracy MCP SSE handshake failed - endpoint event had no URL. "
+                f"Is Tracy MCP running on {addr}us"
             )
 
         # Mark connected now so send_request() passes its self.connected check
@@ -942,7 +942,7 @@ class TracyHttpClient:
                     event_type, data = self._parse_sse_event(event_text)
 
                     if event_type == "endpoint":
-                        # First endpoint event — store URL and signal connect()
+                        # First endpoint event - store URL and signal connect()
                         if not self._message_url:
                             self._message_url = data.strip()
                             logger.debug("Tracy SSE -> endpoint event: %s", self._message_url)
@@ -1004,7 +1004,7 @@ class TracyHttpClient:
                         resp_id,
                     )
         else:
-            # Notification (no id) — dispatch to callbacks
+            # Notification (no id) - dispatch to callbacks
             method = msg.get("method", "unknown")
             params = msg.get("params", {})
             logger.debug("Tracy SSE <- notification: method=%s", method)
@@ -1070,8 +1070,8 @@ class TracyHttpClient:
         """
         if not self.connected:
             raise TracyConnectionError(
-                "Not connected to Tracy MCP — call connect() first. "
-                "Is Tracy MCP running?"
+                "Not connected to Tracy MCP - call connect() first. "
+                "Is Tracy MCP runningus"
             )
 
         with self._lock:
@@ -1102,12 +1102,12 @@ class TracyHttpClient:
                     "Tracy SSE POST failed with status %d: %s",
                     resp.status_code, resp.text[:200],
                 )
-                # Don't raise yet — the response might still arrive via SSE
+                # Don't raise yet - the response might still arrive via SSE
                 # Fall through to wait_for_response
 
         except Exception as exc:
             logger.warning("Tracy SSE POST error: %s", exc)
-            # Fall through to wait_for_response — might still arrive
+            # Fall through to wait_for_response - might still arrive
 
         # Wait for response on SSE stream
         return self._wait_for_response(req_id, req_timeout)
@@ -1140,7 +1140,7 @@ class TracyHttpClient:
 
         Returns the raw tools list from the MCP `tools/list` response.
         """
-        logger.info("Discovering Tracy MCP tools …")
+        logger.info("Discovering Tracy MCP tools ...")
         response = self.send_request("tools/list", None, timeout)
 
         if "error" in response:
@@ -1154,7 +1154,7 @@ class TracyHttpClient:
         logger.info(
             "Discovered %d Tracy MCP tools: %s",
             len(tools),
-            ", ".join(t.get("name", "?") for t in tools),
+            ", ".join(t.get("name", "us") for t in tools),
         )
         return tools
 
@@ -1215,7 +1215,7 @@ class TracyToolRegistry:
 
         Sends `tools/list` and caches the result.
         """
-        logger.info("Discovering Tracy MCP tools …")
+        logger.info("Discovering Tracy MCP tools ...")
         tools = self._client.discover_tools(timeout)
         self._tools = tools
         self._tool_map = {t["name"]: t for t in self._tools}
@@ -1336,7 +1336,7 @@ class TracyAutoStart:
             )
             return False
 
-        logger.info("Starting Tracy MCP …")
+        logger.info("Starting Tracy MCP ...")
         try:
             python = sys.executable or "python3"
             self._process = subprocess.Popen(
@@ -1396,7 +1396,7 @@ class TracyAutoStart:
             return None
 
         logger.info(
-            "Auto-connecting Tracy MCP to engine at %s:%d …", address, port
+            "Auto-connecting Tracy MCP to engine at %s:%d ...", address, port
         )
 
         try:
@@ -1434,7 +1434,7 @@ class TracyAutoStart:
         except TracyConnectionError as exc:
             import traceback
             logger.warning(
-                "Tracy live_connect failed — exception details:"
+                "Tracy live_connect failed - exception details:"
             )
             logger.warning(
                 "  Exception type    : %s",
@@ -1471,19 +1471,19 @@ class TracyAutoStart:
             )
             logger.warning(
                 "  Hint              : is the engine built with TRACY_ENABLE? "
-                "Is Tracy MCP running and healthy?"
+                "Is Tracy MCP running and healthyus"
             )
             return None
 
     def cleanup(self) -> None:
-        """Clean up resources (don't kill Tracy MCP — it may be shared)."""
+        """Clean up resources (don't kill Tracy MCP - it may be shared)."""
         # We don't kill Tracy MCP on exit since it may be used by other tools
         # The PID file cleanup is handled by tracy_mcp.py itself
         pass
 
 
 # ---------------------------------------------------------------------------
-# Phase 3 — Profile Tools
+# Phase 3 - Profile Tools
 # ---------------------------------------------------------------------------
 
 
@@ -1656,7 +1656,7 @@ json.dumps(result)
         if not zones:
             logger.warning(
                 "No Tracy zones found with new entries after profiling pattern %r. "
-                "Did you instrument matching tracy.ZoneBeginN(...) / tracy.ZoneEnd() zones?",
+                "Did you instrument matching tracy.ZoneBeginN(...) / tracy.ZoneEnd() zonesus",
                 zone_pattern,
             )
         return result
@@ -1823,7 +1823,7 @@ json.dumps(result)
 
 
 # ---------------------------------------------------------------------------
-# Phase 4 — Main Server Entrypoint
+# Phase 4 - Main Server Entrypoint
 # ---------------------------------------------------------------------------
 
 

@@ -3,7 +3,7 @@ if not Spring.Utilities.IsDevMode() then
 end
 
 --------------------------------------------------------------------------------
--- BAR MCP Server — Developer Tool
+-- BAR MCP Server - Developer Tool
 --
 -- Implements a Model Context Protocol (MCP) server over a local TCP socket so
 -- that AI coding assistants (e.g. Claude Desktop, VS Code GitHub Copilot) can
@@ -14,30 +14,21 @@ end
 -- Guard:     Only loads in dev mode (Spring.Utilities.IsDevMode() == true).
 --
 -- Architecture
--- ┌─────────────────────────────┐   TCP/JSON-RPC    ┌────────────────────────┐
--- │  AI client (Claude / Copilot│ ◄────────────────► │  dbg_bar_mcp.lua       │
--- │  VS Code MCP extension …)   │                   │  (LuaUI widget,        │
--- └─────────────────────────────┘                   │   unsynced context)    │
---                                                   └──────────┬─────────────┘
---                                  Spring.SendLuaRulesMsg ▼   │ ▲ Spring.SendLuaUIMsg
---                                                   ┌──────────┴─────────────┐
---                                                   │  dbg_gadget_auto_      │
---                                                   │  reloader.lua          │
---                                                   │  (LuaRules gadget,     │
---                                                   │   synced context)      │
---                                                   └────────────────────────┘
+--   AI MCP client <-> dbg_bar_mcp.lua (LuaUI widget, unsynced)
+--   dbg_bar_mcp.lua -> Spring.SendLuaRulesMsg -> dbg_gadget_auto_reloader.lua
+--   dbg_gadget_auto_reloader.lua -> Spring.SendLuaUIMsg -> dbg_bar_mcp.lua
 --
 -- Exposed MCP tools
---   lua_eval          – run Lua in the unsynced widget environment, return value(s)
---   lua_eval_synced   – run Lua in the synced gadget environment (async; needs cheats)
---   widget_list       – list all known LuaUI widgets and their active state
---   widget_reload     – disable then re-enable a widget by name
---   spring_command    – send a Spring/Recoil console command (e.g. "reloadshaders")
---   vfs_read          – read a VFS file (capped at 512 KB)
---   vfs_list          – list VFS directory contents with a glob pattern
---   game_info         – current frame, map/mod name, player, cheat/dev flags
---   gadget_list       – list all known LuaRules gadgets (async via gadget companion)
---   gadget_reload     – disable then re-enable a gadget (async)
+--   lua_eval          - run Lua in the unsynced widget environment, return value(s)
+--   lua_eval_synced   - run Lua in the synced gadget environment (async; needs cheats)
+--   widget_list       - list all known LuaUI widgets and their active state
+--   widget_reload     - disable then re-enable a widget by name
+--   spring_command    - send a Spring/Recoil console command (e.g. "reloadshaders")
+--   vfs_read          - read a VFS file (capped at 512 KB)
+--   vfs_list          - list VFS directory contents with a glob pattern
+--   game_info         - current frame, map/mod name, player, cheat/dev flags
+--   gadget_list       - list all known LuaRules gadgets (async via gadget companion)
+--   gadget_reload     - disable then re-enable a gadget (async)
 --
 -- Async tools forward a message to the synced gadget companion via
 -- Spring.SendLuaRulesMsg("mcp_<op>:<reqId>:<args>").  The gadget executes the
@@ -45,7 +36,7 @@ end
 -- Spring.SendLuaUIMsg("mcp_result:<reqId>:<json>"), which widget:RecvLuaMsg
 -- picks up and delivers back to the waiting TCP client.
 --
--- MCP client setup (Claude Desktop — claude_desktop_config.json):
+-- MCP client setup (Claude Desktop - claude_desktop_config.json):
 --   {
 --     "mcpServers": {
 --       "BAR": {
@@ -55,7 +46,7 @@ end
 --     }
 --   }
 -- Note: MCP-over-raw-TCP is not yet part of the official MCP spec; use an
--- intermediary proxy (mcp-remote, socat, or a thin stdio↔TCP bridge) if your
+-- intermediary proxy (mcp-remote, socat, or a thin stdio<->TCP bridge) if your
 -- client only supports stdio or SSE transports.
 --------------------------------------------------------------------------------
 --
@@ -690,7 +681,7 @@ function widget:Initialize()
 	server:setoption("reuseaddr", true)
 	local ok, err = server:bind(MCP_HOST, MCP_PORT)
 	if not ok then
-		spEcho("[BARMCP] bind failed on " .. MCP_HOST .. ":" .. MCP_PORT .. " — " .. tostring(err))
+		spEcho("[BARMCP] bind failed on " .. MCP_HOST .. ":" .. MCP_PORT .. " - " .. tostring(err))
 		widgetHandler:RemoveWidget()
 		return
 	end
