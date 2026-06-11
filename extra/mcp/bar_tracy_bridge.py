@@ -142,6 +142,7 @@ class BarTcpClient:
         self._buffer = ""
         self._lock = threading.Lock()
         self._send_lock = threading.Lock()
+        self._rpc_lock = threading.RLock()
         self._request_id = 0
 
         # Response demultiplexing: request_id -> (Event, result_or_error)
@@ -524,10 +525,11 @@ class BarTcpClient:
         Returns the parsed JSON-RPC response dict.
         Raises BarConnectionError on transport or protocol errors.
         """
-        req_id = self.send_jsonrpc(method, params)
-        response = self.receive_response(req_id, timeout)
-        logger.debug("BAR TCP <- response id=%s", response.get("id"))
-        return response
+        with self._rpc_lock:
+            req_id = self.send_jsonrpc(method, params)
+            response = self.receive_response(req_id, timeout)
+            logger.debug("BAR TCP <- response id=%s", response.get("id"))
+            return response
 
     def call_tool(self, tool_name: str, arguments: Optional[Dict[str, Any]] = None, timeout: float = 120.0) -> Dict[str, Any]:
         """Call a BAR MCP tool via `tools/call` and return the result.
@@ -1831,23 +1833,41 @@ def create_bridge_server() -> Any:
     """Create the FastMCP server instance with basic configuration."""
     import mcp.server.fastmcp as fastmcp
 
+# Ok this prompt on how to profile with tracy must be fully complete and detailed, because it's the main value prop of this tool and we want to make sure users understand how to use it effectively. We also want to set expectations about what profiling is suitable for (repeated code paths, not one-shot init/shutdown code), and how to interpret results. The instructions should be clear enough that even users new to Tracy can get started with profiling their BAR Lua code using this MCP bridge.
     server = fastmcp.FastMCP(name = "Beyond All Reason + Tracy profiling MCP server",
     instructions = """
-    This server exposes tools for the game Beyond All Reason (BAR) on the Recoil Engine (SpringRTS) for developing and profiling BAR LuaUI widgets and LuaRules gadgets, with deep integration to Tracy for performance insights.
-    Tracy profiling should be done by adding searchable zones in the Lua code, e.g. tracy.ZoneBeginN("MyWidget:Update") / tracy.ZoneEnd(), then calling profile_zone_pattern with a regex such as "^MyWidget:".
-    Ensure all return paths are covered with tracy.ZoneEnd(). 
-    Example:
-    '''lua 
+# Beyond All Reason + Tracy Profiling MCP Server
+
+This server exposes tools for the game Beyond All Reason (BAR) on the Recoil Engine (SpringRTS) for developing and profiling BAR LuaUI widgets and LuaRules gadgets, with deep integration to Tracy for performance insights.
+
+Tracy profiling should be done by adding searchable zones in the Lua code, e.g. tracy.ZoneBeginN("MyWidget:Update") / tracy.ZoneEnd(), then calling profile_zone_pattern with a regex such as "^MyWidget:".
+
+Example:
+
+'''lua 
 function foo(bar)
-    tracy.ZoneBeginN("MyWidget:foo")
-    -- widget update logic here
+    tracy.ZoneBeginN("MyWidget:foo") -- start a zone with a custom name (appears in Tracy UI)
+    
+    -- do work here  
+    
     if bar > 0 then
-        tracy.ZoneEnd()
+        tracy.ZoneEnd() -- end the zone before any early return
         return true
     end
-    tracy.ZoneEnd()
+    tracy.ZoneEnd() -- make sure to end the zone on all code paths
 end
-    '''
+'''
+## Important Guidelines for instrumenting zones:
+- Do not localize the tracy.ZoneBeginN / ZoneEnd calls - they must be global, always use tracy.ZoneBeginN(...) and tracy.ZoneEnd() directly
+- Only put tracy zones within functions, do not place them in the top levels of the script.
+- Always ensure that every tracy.ZoneBeginN(...) is paired with a tracy.ZoneEnd() on all code paths, including error paths. Unmatched zones can lead to incorrect profiling data and potential memory leaks in Tracy.
+- Do not profile single-shot code that runs once at startup or shutdown, unless specifically asked, such as:
+    - Initialize(), Shutdown(), Initialize(), Shutdown()
+- Focus on code that runs repeatedly during gameplay, such as:
+    - Update(), MousePress(), GameFrame(), etc.
+- Functions such as `function widget:Update()` are called every frame, so they are prime candidates for profiling. Instrumenting them with zones allows you to see how much time is spent in each part of the update logic across frames.
+- Some functions are already pre-instrumented, such as `widget:GameFrame()`, with the zone naming: "W:GameFrame:MyWidget" for widget code and "G:GameFrame:MyGadget" for gadget code.
+ 
     """)
     return server
 
@@ -2314,8 +2334,7 @@ class BarBackendSupervisor:
             "capabilities": {},
             "clientInfo": {"name": "bar_tracy_bridge", "version": "1.0.0"},
         }
-        init_req_id = self.client.send_jsonrpc("initialize", init_params)
-        init_response = self.client.receive_response(init_req_id, timeout=5.0)
+        init_response = self.client.call_method("initialize", init_params, timeout=5.0)
         if "error" in init_response:
             logger.warning("BAR MCP initialize error: %s", init_response["error"].get("message", "unknown"))
         self.client.send_notification("notifications/initialized")
